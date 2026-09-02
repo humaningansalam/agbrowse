@@ -21,14 +21,15 @@ afterEach(() => {
 
 describe('web-ai policy CLI', () => {
     it('allows provider copy capture when the CLI fallback flag is explicitly set', async () => {
-        const deps = { getPage: vi.fn(() => { throw new Error('now browser may be reached'); }) };
+        const deps = { getPage: vi.fn(() => { throw new Error('active tab must not be reached'); }) };
         await expect(runWebAiCli([
             'poll',
             '--vendor', 'chatgpt',
+            '--session', 'missing-copy-allowed',
             '--allow-copy-markdown-fallback',
             '--json',
-        ], deps)).rejects.toThrow(/now browser may be reached/);
-        expect(deps.getPage).toHaveBeenCalled();
+        ], deps)).rejects.toThrow(/Session not found/);
+        expect(deps.getPage).not.toHaveBeenCalled();
     });
 
     it('fails before browser mutation when policy explicitly disables provider copy capture', async () => {
@@ -41,6 +42,7 @@ describe('web-ai policy CLI', () => {
             await expect(runWebAiCli([
                 'poll',
                 '--vendor', 'chatgpt',
+                '--session', 'missing-copy-denied',
                 '--allow-copy-markdown-fallback',
                 '--policy', 'tmp-deny-copy-policy.json',
                 '--json',
@@ -52,27 +54,29 @@ describe('web-ai policy CLI', () => {
     });
 
     it('allows provider copy capture with the legacy clipboard-read unsafe allowance', async () => {
-        const deps = { getPage: vi.fn(() => { throw new Error('now browser may be reached'); }) };
+        const deps = { getPage: vi.fn(() => { throw new Error('active tab must not be reached'); }) };
         await expect(runWebAiCli([
             'poll',
             '--vendor', 'chatgpt',
+            '--session', 'missing-copy-legacy-alias',
             '--allow-copy-markdown-fallback',
             '--unsafe-allow', 'clipboard-read',
             '--json',
-        ], deps)).rejects.toThrow(/now browser may be reached/);
-        expect(deps.getPage).toHaveBeenCalled();
+        ], deps)).rejects.toThrow(/Session not found/);
+        expect(deps.getPage).not.toHaveBeenCalled();
     });
 
     it('allows provider copy capture with clipboard-write-intercept unsafe allowance', async () => {
-        const deps = { getPage: vi.fn(() => { throw new Error('reached browser via new alias'); }) };
+        const deps = { getPage: vi.fn(() => { throw new Error('active tab must not be reached'); }) };
         await expect(runWebAiCli([
             'poll',
             '--vendor', 'chatgpt',
+            '--session', 'missing-copy-new-alias',
             '--allow-copy-markdown-fallback',
             '--unsafe-allow', 'clipboard-write-intercept',
             '--json',
-        ], deps)).rejects.toThrow(/reached browser via new alias/);
-        expect(deps.getPage).toHaveBeenCalled();
+        ], deps)).rejects.toThrow(/Session not found/);
+        expect(deps.getPage).not.toHaveBeenCalled();
     });
 
     it('enforces denied vendor default origin before browser mutation', async () => {
@@ -132,10 +136,12 @@ describe('web-ai policy CLI', () => {
             ]);
         });
 
-        it('S4: rejects a session-less poll, which has nowhere to save', async () => {
-            await runRejected([
+        it('S4: rejects a session-less poll before evaluating artifact capture', async () => {
+            const deps = { getPage: vi.fn(() => { throw new Error('browser should not be touched'); }) };
+            await expect(runWebAiCli([
                 'poll', '--vendor', 'chatgpt', '--require-file-artifacts', '--json',
-            ]);
+            ], deps)).rejects.toThrow(/requires --session/);
+            expect(deps.getPage).not.toHaveBeenCalled();
         });
 
         it('S5: a supported combination is NOT rejected', async () => {

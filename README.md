@@ -533,18 +533,17 @@ agbrowse tab-cleanup --include-untracked --idle-after 10m
 Web-ai tab behavior:
 
 ```bash
-# Default: new tab per send/query (Phase 9.1)
-agbrowse web-ai send --vendor chatgpt --inline-only --prompt "hello"
-
-# Legacy: reuse the existing active tab
-agbrowse web-ai send --vendor chatgpt --reuse-tab --inline-only --prompt "hello"
-export AGBROWSE_REUSE_TAB=1            # global legacy mode
+SID=$(agbrowse web-ai send --vendor chatgpt --inline-only \
+        --prompt "hello" --json | jq -r .sessionId)
+agbrowse web-ai poll --session "$SID"
+agbrowse web-ai snapshot --session "$SID"
 ```
 
-Session-to-tab binding is strong: `poll` and `stop` with `--session` resolve
-the session's bound tab, not the globally active tab. If the tab was closed,
-the runtime auto-recovers by creating a new tab and navigating to the saved
-`conversationUrl`.
+Every new session gets a fresh provider tab. Existing provider tabs are never
+scanned, borrowed, or reused. `poll`, `stop`, `watch`, and `snapshot` require a
+`sessionId` and resolve only the exact `targetId` stored by that session, never
+the globally active tab. If the target was closed, recovery may create a new
+tab only from that same session's saved `conversationUrl`.
 
 Tab limits:
 
@@ -597,11 +596,13 @@ Commands:
 
 ```bash
 agbrowse web-ai render            # render the prompt envelope only
-agbrowse web-ai status            # check active tab + composer
+agbrowse web-ai status            # check active tab before a session exists
+agbrowse web-ai status --session <id> # check that session's exact target
 agbrowse web-ai send              # submit and return a sessionId
-agbrowse web-ai poll              # wait for completion
+agbrowse web-ai poll --session <id> # wait on the bound target
 agbrowse web-ai query             # send + poll
-agbrowse web-ai stop              # press Escape on the active tab
+agbrowse web-ai stop --session <id> # press Escape on the bound target
+agbrowse web-ai snapshot --session <id> # snapshot the bound target
 agbrowse web-ai project-sources   # list/add ChatGPT Project Sources
 agbrowse web-ai code              # generate + retrieve ChatGPT code zip artifacts
 agbrowse web-ai code-extract      # re-retrieve zip artifacts from an old conversation
@@ -679,11 +680,9 @@ SID=$(agbrowse web-ai send --vendor chatgpt --model pro --inline-only \
 agbrowse web-ai poll --vendor chatgpt --session "$SID"
 ```
 
-`poll` resolves the session in priority order: `--session <id>` > active
-target id > vendor latest > legacy baseline. On a shared CDP port, session-less
-`poll`/`stop` auto-bind only when exactly one active provider session exists;
-two or more active sessions fail closed with `session.target-ambiguous` and
-candidate `sessionId`/`targetId` evidence. Each completion / timeout updates
+`poll`, `stop`, `watch`, and `snapshot` require `--session <id>`. They resolve
+the session's persisted `targetId` directly and never inspect the active tab,
+tab order, provider origin, or another session. Each completion / timeout updates
 the session record with `status`, `conversationUrl`, and `answer`. Completed
 sessions also expose local artifact descriptors in
 `agbrowse web-ai sessions show <id>` when transcript, report, or image artifacts
@@ -752,7 +751,7 @@ Initial `errorCode` catalog:
   `provider.commit-not-verified`, `provider.poll-timeout`,
   `provider.runtime-disabled`
 - `capability.unsupported`
-- `session.target-ambiguous`
+- `input.session-required`
 - `context.over-budget`, `context.symlink-rejected`,
   `context.transform-invalid`, `context.transform-failed`
 - `grok.context-pack-not-allowed`

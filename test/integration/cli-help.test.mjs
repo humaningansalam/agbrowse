@@ -42,7 +42,8 @@ describe.sequential('CLI help', () => {
         expect(result.stdout).toContain('Before agent-run Web AI automation:');
         expect(result.stdout).toContain('skills install --target <agent-skill-root>');
         expect(result.stdout).toContain('AGBROWSE_MAX_TABS');
-        expect(result.stdout).toContain('--reuse-tab');
+        expect(result.stdout).toContain('One session owns one targetId');
+        expect(result.stdout).not.toContain('--reuse-tab');
         expect(result.stdout).toContain('runway selectors');
         expect(result.stdout).toContain('runway poll');
         expect(result.stdout).toContain('never submits a generation');

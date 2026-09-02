@@ -424,25 +424,36 @@ describe('web-ai cli session flags', () => {
         expect(mcpSrc).toMatch(/withMcpActiveCommand\(name, provider, sessionDeps, sessionArgs/);
     });
 
-    it('reuses inactive provider tabs before creating another ChatGPT tab', () => {
-        expect(cliSrc).toContain("import { createTab, listManagedTabs, waitForPageByTargetId }");
-        expect(cliSrc).toMatch(/async function findReusableProviderTab\(port, vendor, targetUrl\)/);
-        expect(cliSrc).toMatch(/activeCommandTargetIds\(\{ browserProfileKey: String\(port\) \}\)/);
-        expect(cliSrc).toMatch(/listSessions\(\{ active: true \}\)/);
-        expect(cliSrc).toMatch(/listLeases\(\)/);
-        expect(cliSrc).toMatch(/!isPinned\(tab\.targetId\)/);
-        expect(cliSrc).toMatch(/isReusableByLease\(tab\.targetId, leaseByTargetId\)/);
-        expect(cliSrc).toMatch(/!shouldNavigateToRequestedProviderUrl\(tab\.url, targetUrl\)/);
-        expect(cliSrc).toMatch(/input\.forceNewTab !== true/);
-        expect(cliSrc).toMatch(/const reusable = await findReusableProviderTab/);
-        expect(cliSrc).toMatch(/pooled && !shouldNavigateToRequestedProviderUrl\(pooled\.url, vendorUrl\)/);
-        expect(cliSrc).toMatch(/bindReusableProviderPage\(deps, port, pooled, vendorUrl\)/);
-        expect(cliSrc).toMatch(/isProviderPageDriveable\(page, vendorUrl\)/);
+    it('creates a fresh target for every new session and never scans or checks out existing tabs', () => {
+        expect(cliSrc).toContain("import { createTab, waitForPageByTargetId }");
         expect(cliSrc).toMatch(/createTab\(port, vendorUrl, \{ activate: false, reuseBlank: false \}\)/);
-        expect(cliSrc).toMatch(/prepareProviderPage: async \(\) =>/);
-        expect(cliSrc).toMatch(/shouldNavigateToRequestedProviderUrl\(currentUrl, vendorUrl\)/);
-        expect(cliSrc).toMatch(/page\.goto\(vendorUrl/);
-        expect(cliSrc).toMatch(/if \(input\.forceNewTab !== true\) \{\s*\/\/ Phase 9\.2: try tab pool first/s);
+        expect(cliSrc).toMatch(/newTab: \['send', 'query', 'code'\]\.includes\(command\) && !values\.session/);
+        expect(cliSrc).not.toContain('findReusableProviderTab');
+        expect(cliSrc).not.toContain('getPooledTab');
+        expect(cliSrc).not.toContain('listManagedTabs');
+    });
+
+    it('requires an explicit session for stateful tab commands and binds snapshot by targetId', () => {
+        expect(cliSrc).toContain("const EXPLICIT_SESSION_COMMANDS = new Set(['poll', 'stop', 'watch', 'snapshot'])");
+        expect(cliSrc).toMatch(/function enforceStrictSessionTargeting\(command, input\)/);
+        expect(cliSrc).toMatch(/web-ai \$\{command\} requires --session <sessionId>/);
+        expect(cliSrc).not.toContain('resolveImplicitCommandSession');
+        expect(cliSrc).not.toContain('resolveImplicitSessionSelection');
+        expect(cliSrc).toMatch(/async function runSnapshotCommand\(deps, input, values\)[\s\S]*?resolveSessionPage\(deps, input\.session/);
+        expect(cliSrc).toMatch(/buildWebAiSnapshot\(resolved\.page/);
+        expect(cliSrc).toMatch(/async function runStatusCommand\(deps, input, statusFn\)[\s\S]*?resolveSessionPage\(deps, input\.session/);
+    });
+
+    it('does not hold the session mutation lock across a long poll', () => {
+        const start = cliSrc.indexOf('async function runBoundCommand');
+        const end = cliSrc.indexOf('function isRecoverableTabCrash');
+        const section = cliSrc.slice(start, end);
+        const pollStart = section.indexOf("if (command === 'poll')");
+        const pollSection = section.slice(pollStart);
+
+        expect(pollSection).toContain('withSessionPage(deps, input.session');
+        expect(pollSection).toContain('withWebAiActiveCommand(command, sessionDeps');
+        expect(pollSection).not.toContain('withSessionCommandLock');
     });
 
     it('repairs bound session pages that are alive but navigated to another conversation', () => {

@@ -15,6 +15,9 @@ beforeEach(() => {
 afterEach(() => {
     vi.restoreAllMocks();
     vi.doUnmock('../../skills/browser/tab-manager.mjs');
+    vi.doUnmock('../../skills/browser/tab-lifecycle.mjs');
+    vi.doUnmock('../../web-ai/ax-snapshot.mjs');
+    vi.doUnmock('../../web-ai/chatgpt.mjs');
     if (ORIGINAL_HOME === undefined) delete process.env.BROWSER_AGENT_HOME;
     else process.env.BROWSER_AGENT_HOME = ORIGINAL_HOME;
     rmSync(tmpHome, { recursive: true, force: true });
@@ -22,49 +25,225 @@ afterEach(() => {
 });
 
 describe('web-ai shared target lock guard', () => {
-    it('vendor-scopes active candidates and fails closed on 2+ active sessions', async () => {
-        const { createSession, updateSession } = await import('../../web-ai/session.mjs');
-        const { resolveImplicitSessionSelection } = await import('../../web-ai/session-target-guard.mjs');
-        const expired = new Date(Date.now() - 60_000).toISOString();
-        const a = createSession({ vendor: 'chatgpt', prompt: 'a', attachmentPolicy: 'inline-only' }, { targetId: 'target-a', conversationUrl: 'https://chatgpt.com/c/a' });
-        const b = createSession({ vendor: 'chatgpt', prompt: 'b', attachmentPolicy: 'inline-only' }, { targetId: 'target-b', conversationUrl: 'https://chatgpt.com/c/b' });
-        const completed = createSession({ vendor: 'chatgpt', prompt: 'done', attachmentPolicy: 'inline-only' }, { targetId: 'target-done', conversationUrl: 'https://chatgpt.com/c/done' });
-        createSession({ vendor: 'chatgpt', prompt: 'expired', attachmentPolicy: 'inline-only' }, { deadlineAt: expired, targetId: 'target-expired', conversationUrl: 'https://chatgpt.com/c/expired' });
-        createSession({ vendor: 'gemini', prompt: 'g', attachmentPolicy: 'inline-only' }, { targetId: 'target-g', conversationUrl: 'https://gemini.google.com/app/g' });
-        updateSession(completed.sessionId, { status: 'completed' });
-
-        let captured;
-        try {
-            resolveImplicitSessionSelection({ command: 'poll', vendor: 'chatgpt', port: 9222 });
-        } catch (err) {
-            captured = err;
-        }
-
-        expect(captured?.errorCode).toBe('session.target-ambiguous');
-        expect(captured?.stage).toBe('target-resolution');
-        expect(captured?.retryHint).toBe('pass-session');
-        expect(captured?.evidence).toMatchObject({
-            command: 'poll',
-            vendor: 'chatgpt',
-            port: 9222,
+    it('creates a distinct target for every new send without consulting the active tab', async () => {
+        const pages = new Map([
+            ['target-a', {
+                url: vi.fn(() => 'https://chatgpt.com/'),
+                context: vi.fn(() => ({ newCDPSession: vi.fn(async () => ({})) })),
+            }],
+            ['target-b', {
+                url: vi.fn(() => 'https://chatgpt.com/'),
+                context: vi.fn(() => ({ newCDPSession: vi.fn(async () => ({})) })),
+            }],
+        ]);
+        const createTab = vi.fn()
+            .mockResolvedValueOnce({ targetId: 'target-a' })
+            .mockResolvedValueOnce({ targetId: 'target-b' });
+        const waitForPageByTargetId = vi.fn(async (_port, targetId) => pages.get(targetId));
+        const cleanupIdleTabs = vi.fn(async () => ({ closed: [] }));
+        const sendWebAi = vi.fn(async deps => {
+            const targetId = await deps.getTargetId();
+            const page = await deps.getPage();
+            return {
+                ok: true,
+                status: 'sent',
+                vendor: 'chatgpt',
+                sessionId: `session-${targetId}`,
+                targetId,
+                url: page.url(),
+                warnings: [],
+            };
         });
-        expect(captured.evidence.candidates.map(candidate => candidate.sessionId)).toEqual([a.sessionId, b.sessionId]);
-        expect(JSON.stringify(captured.evidence.candidates)).not.toContain('target-done');
-        expect(JSON.stringify(captured.evidence.candidates)).not.toContain('target-expired');
-        expect(JSON.stringify(captured.evidence.candidates)).not.toContain('target-g');
+        vi.doMock('../../skills/browser/tab-manager.mjs', () => ({
+            createTab,
+            getPageByTargetId: vi.fn(async () => null),
+            isTabAlive: vi.fn(async () => true),
+            probeTabAlive: vi.fn(async () => 'alive'),
+            listManagedTabs: vi.fn(async () => []),
+            waitForPageByTargetId,
+        }));
+        vi.doMock('../../skills/browser/tab-lifecycle.mjs', async () => ({
+            ...(await vi.importActual('../../skills/browser/tab-lifecycle.mjs')),
+            cleanupIdleTabs,
+        }));
+        vi.doMock('../../web-ai/chatgpt.mjs', async () => ({
+            ...(await vi.importActual('../../web-ai/chatgpt.mjs')),
+            sendWebAi,
+        }));
+
+        const { runWebAiCli } = await import('../../web-ai/cli.mjs');
+        const activePageLookup = vi.fn(async () => ({ url: () => 'https://chatgpt.com/c/wrong-active-tab' }));
+        const deps = {
+            getPort: () => 9222,
+            getPage: activePageLookup,
+            getBrowserStatus: async () => ({ running: true }),
+            readBrowserState: () => ({ headless: false }),
+        };
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+        try {
+            const first = await runWebAiCli([
+                'send', '--vendor', 'chatgpt', '--inline-only', '--prompt', 'first', '--json',
+            ], deps);
+            const second = await runWebAiCli([
+                'send', '--vendor', 'chatgpt', '--inline-only', '--prompt', 'second', '--json',
+            ], deps);
+
+            expect(first).toMatchObject({ sessionId: 'session-target-a', targetId: 'target-a' });
+            expect(second).toMatchObject({ sessionId: 'session-target-b', targetId: 'target-b' });
+            expect(createTab).toHaveBeenNthCalledWith(1, 9222, 'https://chatgpt.com', {
+                activate: false,
+                reuseBlank: false,
+            });
+            expect(createTab).toHaveBeenNthCalledWith(2, 9222, 'https://chatgpt.com', {
+                activate: false,
+                reuseBlank: false,
+            });
+            expect(waitForPageByTargetId).toHaveBeenNthCalledWith(1, 9222, 'target-a');
+            expect(waitForPageByTargetId).toHaveBeenNthCalledWith(2, 9222, 'target-b');
+            expect(cleanupIdleTabs).toHaveBeenCalledTimes(2);
+            expect(sendWebAi).toHaveBeenCalledTimes(2);
+            expect(activePageLookup).not.toHaveBeenCalled();
+        } finally {
+            logSpy.mockRestore();
+        }
     });
 
-    it('auto-binds exactly one active provider session and keeps zero-session legacy routing', async () => {
+    it('requires sessionId before poll, stop, watch, or snapshot can touch Chrome', async () => {
+        const { runWebAiCli } = await import('../../web-ai/cli.mjs');
+        const getBrowserStatus = vi.fn(async () => ({ running: true }));
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        try {
+            for (const command of ['poll', 'stop', 'watch', 'snapshot']) {
+                const failure = await runWebAiCli([command, '--json'], {
+                    getPort: () => 9222,
+                    getBrowserStatus,
+                    readBrowserState: () => ({ headless: false }),
+                }).then(() => null, err => err);
+
+                expect(failure).toMatchObject({
+                    errorCode: 'input.session-required',
+                    stage: 'input-preflight',
+                    retryHint: 'pass-session',
+                    evidence: { command },
+                });
+            }
+        } finally {
+            errorSpy.mockRestore();
+        }
+
+        expect(getBrowserStatus).not.toHaveBeenCalled();
+    });
+
+    it('snapshots the session target even when deps.getPage points at another active tab', async () => {
+        const pageA = { url: vi.fn(() => 'https://chatgpt.com/c/a') };
+        const pageB = { url: vi.fn(() => 'https://chatgpt.com/c/b') };
+        const getPageByTargetId = vi.fn(async (_port, targetId) => targetId === 'target-a' ? pageA : null);
+        const buildWebAiSnapshot = vi.fn(async page => ({
+            snapshotId: 'snapshot-a',
+            provider: 'chatgpt',
+            url: page.url(),
+            domHash: null,
+            axHash: 'sha256:a',
+            text: 'page-a',
+            refs: {},
+            stats: { nodeCount: 1, interactiveCount: 0, tokenEstimate: 2 },
+        }));
+        vi.doMock('../../skills/browser/tab-manager.mjs', () => ({
+            createTab: vi.fn(),
+            getPageByTargetId,
+            isTabAlive: vi.fn(async () => true),
+            probeTabAlive: vi.fn(async () => 'alive'),
+            listManagedTabs: vi.fn(async () => []),
+            waitForPageByTargetId: vi.fn(async () => null),
+        }));
+        vi.doMock('../../web-ai/ax-snapshot.mjs', () => ({ buildWebAiSnapshot }));
+
         const { createSession } = await import('../../web-ai/session.mjs');
-        const { resolveImplicitSessionSelection } = await import('../../web-ai/session-target-guard.mjs');
+        const { runWebAiCli } = await import('../../web-ai/cli.mjs');
+        const session = createSession(
+            { vendor: 'chatgpt', prompt: 'a', attachmentPolicy: 'inline-only' },
+            { targetId: 'target-a', conversationUrl: 'https://chatgpt.com/c/a' },
+        );
+        const activePageLookup = vi.fn(async () => pageB);
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-        expect(resolveImplicitSessionSelection({ command: 'poll', vendor: 'chatgpt', port: 9222 }))
-            .toMatchObject({ action: 'none', sessionId: null, candidates: [] });
+        try {
+            const result = await runWebAiCli(['snapshot', '--session', session.sessionId, '--json'], {
+                getPort: () => 9222,
+                getPage: activePageLookup,
+                getBrowserStatus: async () => ({ running: true }),
+                readBrowserState: () => ({ headless: false }),
+            });
 
-        const only = createSession({ vendor: 'chatgpt', prompt: 'a', attachmentPolicy: 'inline-only' }, { targetId: 'target-a', conversationUrl: 'https://chatgpt.com/c/a' });
+            expect(result).toMatchObject({
+                sessionId: session.sessionId,
+                targetId: 'target-a',
+                url: 'https://chatgpt.com/c/a',
+                text: 'page-a',
+            });
+            expect(buildWebAiSnapshot).toHaveBeenCalledWith(pageA, expect.any(Object));
+            expect(getPageByTargetId).toHaveBeenCalledWith(9222, 'target-a');
+            expect(activePageLookup).not.toHaveBeenCalled();
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
 
-        expect(resolveImplicitSessionSelection({ command: 'stop', vendor: 'chatgpt', port: 9222 }))
-            .toMatchObject({ action: 'auto-bind', sessionId: only.sessionId, candidates: [{ targetId: 'target-a' }] });
+    it('checks status on the session target even when another tab is active', async () => {
+        const pageA = {
+            url: vi.fn(() => 'https://chatgpt.com/c/a'),
+            context: vi.fn(() => ({ newCDPSession: vi.fn(async () => ({})) })),
+        };
+        const pageB = { url: vi.fn(() => 'https://chatgpt.com/c/b') };
+        const getPageByTargetId = vi.fn(async (_port, targetId) => targetId === 'target-a' ? pageA : null);
+        const statusWebAi = vi.fn(async deps => {
+            const page = await deps.getPage();
+            return { ok: true, vendor: 'chatgpt', status: 'ready', url: page.url(), capabilities: [], warnings: [] };
+        });
+        vi.doMock('../../skills/browser/tab-manager.mjs', () => ({
+            createTab: vi.fn(),
+            getPageByTargetId,
+            isTabAlive: vi.fn(async () => true),
+            probeTabAlive: vi.fn(async () => 'alive'),
+            listManagedTabs: vi.fn(async () => []),
+            waitForPageByTargetId: vi.fn(async () => null),
+        }));
+        vi.doMock('../../web-ai/chatgpt.mjs', async () => ({
+            ...(await vi.importActual('../../web-ai/chatgpt.mjs')),
+            statusWebAi,
+        }));
+
+        const { createSession } = await import('../../web-ai/session.mjs');
+        const { runWebAiCli } = await import('../../web-ai/cli.mjs');
+        const session = createSession(
+            { vendor: 'chatgpt', prompt: 'a', attachmentPolicy: 'inline-only' },
+            { targetId: 'target-a', conversationUrl: 'https://chatgpt.com/c/a' },
+        );
+        const activePageLookup = vi.fn(async () => pageB);
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+        try {
+            const result = await runWebAiCli(['status', '--session', session.sessionId, '--json'], {
+                getPort: () => 9222,
+                getPage: activePageLookup,
+                getBrowserStatus: async () => ({ running: true }),
+                readBrowserState: () => ({ headless: false }),
+            });
+
+            expect(result).toMatchObject({
+                sessionId: session.sessionId,
+                targetId: 'target-a',
+                url: 'https://chatgpt.com/c/a',
+                status: 'ready',
+            });
+            expect(statusWebAi).toHaveBeenCalledOnce();
+            expect(getPageByTargetId).toHaveBeenCalledWith(9222, 'target-a');
+            expect(activePageLookup).not.toHaveBeenCalled();
+        } finally {
+            logSpy.mockRestore();
+        }
     });
 
     it('documents that stop --session bypasses active-command and session-command locks', async () => {
@@ -72,8 +251,8 @@ describe('web-ai shared target lock guard', () => {
         const runBoundStart = cliSrc.indexOf('async function runBoundCommand');
         const runBoundEnd = cliSrc.indexOf('function isRecoverableTabCrash');
         const runBoundSection = cliSrc.slice(runBoundStart, runBoundEnd);
-        const stopStart = runBoundSection.indexOf("if (command === 'stop' && input.session)");
-        const pollStart = runBoundSection.indexOf("if (command === 'poll' && input.session)");
+        const stopStart = runBoundSection.indexOf("if (command === 'stop')");
+        const pollStart = runBoundSection.indexOf("if (command === 'poll')");
         const stopBranch = runBoundSection.slice(stopStart, pollStart);
 
         expect(cliSrc).toContain('runSessionStopInterrupt');

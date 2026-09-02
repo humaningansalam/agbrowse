@@ -31,8 +31,8 @@ export function formatControlSummary({
         : `attached to running Chrome on port ${cdpPort}`;
     lines.push(`[browser] cdp=localhost:${cdpPort} (${chromeMode})`);
 
-    const tabDesc = tabSource === 'pooled'
-        ? 'pooled (reusing warm session tab)'
+    const tabDesc = tabSource === 'session-target'
+        ? 'bound (session targetId)'
         : tabSource === 'new-tab'
             ? 'new (fresh tab created)'
             : 'active (existing active tab)';

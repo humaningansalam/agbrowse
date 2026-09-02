@@ -3602,16 +3602,16 @@ try {
       Load/install the bundled web-ai skill; help shows flags, the skill gives
       workflow policy. Skills are never installed implicitly.
 	    web-ai render          Render the provider prompt without a browser
-	    web-ai status          Check active provider tab state
+	    web-ai status          Check active tab, or --session <id> exact target
 	    web-ai send            Send a prompt; returns a sessionId for later resume
 	    web-ai work send       Send a prompt through ChatGPT Work with --power N
-	    web-ai poll            Poll a session (or latest baseline) for completion
+	    web-ai poll            Poll --session <id> on its exact target
 	    web-ai query           send + poll in one call
 	    web-ai code            ChatGPT-only code generation + verified zip retrieval
 	    web-ai code-extract    Re-retrieve ChatGPT code zip artifacts without prompting
-	    web-ai stop            Send Escape to the active provider tab
-	    web-ai watch           Watch a persisted session until terminal status
-	    web-ai snapshot        Compact accessibility snapshot for provider tab
+	    web-ai stop            Send Escape to --session <id> exact target
+	    web-ai watch           Watch --session <id> until terminal status
+	    web-ai snapshot        Snapshot --session <id> exact target
 	    web-ai sessions        list/show/resume/reattach/doctor/prune sessions
 	    web-ai doctor          Provider diagnostics and target candidates
 	    web-ai project-sources ChatGPT Project Sources list/add
@@ -3643,15 +3643,13 @@ try {
                                        grok-heavy=3600 · deep-research=3600;
                                        unknown tier falls back
                                        to 1200 ChatGPT/Gemini · 600 Grok
-        --session <id>                 Resume a previous session; surviving
-                                       shell exit + OS sleep
+        --session <id>                 Resolve the exact targetId persisted for
+                                       a previous session
         --deadline <iso>               Override session deadline
         --navigate                     Allow resume to switch tabs if needed
-         --new-tab                      Force a fresh provider tab for send/query
-                                        (default reuses pooled/inactive provider tabs first)
-         --parallel                     Alias for --new-tab. Use to run a query
-                                        without contending with another in-flight one.
-        --reuse-tab                    Reuse active tab (legacy behavior)
+         --new-tab                      Compatibility flag; new sessions always
+                                        create a fresh provider tab
+         --parallel                     Alias for --new-tab
         --json                         JSON output (or AGBROWSE_JSON_ERRORS=1)
 
       Work send flags:
@@ -3659,13 +3657,14 @@ try {
         --power <1..6>                 Required Work Power step
                                        (mapping follows the WP1-probed contract)
 
-      Tab lease policy:
-        Completed provider tabs are runtime leases. Defaults: maxPerKey=3,
+      Tab ownership policy:
+        One session owns one targetId. New sessions never scan or reuse an
+        existing provider tab. Completed tabs may remain as cleanup leases but
+        are never assigned to another session. Retention defaults: maxPerKey=3,
         globalMax=8, TTL=30m. Override via AGBROWSE_PROVIDER_POOL_MAX_PER_KEY,
         AGBROWSE_PROVIDER_POOL_GLOBAL_MAX, AGBROWSE_PROVIDER_POOL_TTL.
         Active session caps default to per-key=5 and global=14. Override via
         AGBROWSE_PROVIDER_ACTIVE_MAX_PER_KEY and AGBROWSE_PROVIDER_ACTIVE_GLOBAL_MAX.
-        Use --new-tab / --parallel to bypass pool reuse for a single call.
         Run tab-cleanup --json to inspect leaseClosedTabs.
 
       Failure envelope when --json or AGBROWSE_JSON_ERRORS=1:
@@ -3719,7 +3718,6 @@ try {
     CDP_PORT               Default CDP port (default: 9222)
     AGBROWSE_MAX_TABS      Max open tabs before cleanup closes oldest (default: 20)
     AGBROWSE_TAB_IDLE      Idle threshold for cleanup (default: 30m)
-    AGBROWSE_REUSE_TAB=1   Legacy web-ai behavior: reuse active tab
     AGBROWSE_WEB_AI_AUTO_START=0
                            Disable web-ai headed auto-start
     AGBROWSE_JSON_ERRORS=1 Force JSON failure envelopes regardless of --json

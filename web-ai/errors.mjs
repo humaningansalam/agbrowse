@@ -9,7 +9,7 @@
 //   cdp.unreachable                 connect              start-or-check-port
 //   cdp.target-mismatch             connect|poll|target-resolution
 //                                                        tab-switch|poll-session
-//   session.target-ambiguous        target-resolution    pass-session
+//   input.session-required          input-preflight      pass-session
 //   provider.composer-not-visible   composer-prereq      re-snapshot
 //   provider.interstitial           provider-interstitial wait-and-retry|login|navigate
 //   provider.model-mismatch         provider-select-mode model-fallback

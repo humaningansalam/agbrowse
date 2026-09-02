@@ -241,7 +241,8 @@ describe('tab lifecycle cleanup selection', () => {
             expect(source).toContain('TTL=30m');
             expect(source).toContain('AGBROWSE_PROVIDER_ACTIVE_MAX_PER_KEY');
         }
-        expect(skillSource).toContain('| TTL per pooled tab | 30 min |');
+        expect(skillSource).toContain('Completed tabs may remain until lifecycle cleanup');
+        expect(skillSource).toMatch(/they are not reusable by\s+new sessions/);
         expect(skillSource).toContain('| Max tabs | 20 |');
         expect(readmeSource).toContain('| Max tabs | 20 |');
     });

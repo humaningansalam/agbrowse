@@ -30,6 +30,7 @@ describe('active command store', () => {
         });
 
         expect(command.status).toBe('running');
+        expect(command.pid).toBe(process.pid);
         expect(await activeCommandTargetIds({ browserProfileKey: '9222' })).toEqual(new Set(['target-1']));
 
         const heartbeat = await heartbeatActiveCommand('cmd-1', { ttlMs: 30_000 });
@@ -71,6 +72,30 @@ describe('active command store', () => {
             targetId: 'target-expired',
             browserProfileKey: '9222',
         })).resolves.toMatchObject({ commandId: 'cmd-after-expiry', status: 'running' });
+    }));
+
+    it('reclaims a target immediately when the owning process is dead', async () => withTempHome(async () => {
+        const deadPid = 2_147_483_647;
+        await registerActiveCommand({
+            commandId: 'cmd-dead-owner',
+            targetId: 'target-dead-owner',
+            browserProfileKey: '9222',
+            pid: deadPid,
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        });
+
+        await expect(registerActiveCommand({
+            commandId: 'cmd-replacement',
+            targetId: 'target-dead-owner',
+            browserProfileKey: '9222',
+        })).resolves.toMatchObject({
+            commandId: 'cmd-replacement',
+            status: 'running',
+            pid: process.pid,
+        });
+
+        const rows = await listActiveCommands({ browserProfileKey: '9222' });
+        expect(rows.find(row => row.commandId === 'cmd-dead-owner')?.status).toBe('stale');
     }));
 
     it('scopes active targets by browser profile key', async () => withTempHome(async () => {

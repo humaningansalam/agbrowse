@@ -41,13 +41,13 @@ standalone `agbrowse` Chrome/CDP runtime.
 agbrowse web-ai render
 agbrowse web-ai status
 agbrowse web-ai send
-agbrowse web-ai poll
+agbrowse web-ai poll --session <id>
 agbrowse web-ai query
 agbrowse web-ai code
 agbrowse web-ai code-extract
-agbrowse web-ai stop
-agbrowse web-ai watch
-agbrowse web-ai snapshot
+agbrowse web-ai stop --session <id>
+agbrowse web-ai watch --session <id>
+agbrowse web-ai snapshot --session <id>
 agbrowse web-ai sessions
 agbrowse web-ai doctor
 agbrowse web-ai project-sources
@@ -197,50 +197,31 @@ Per-runtime pattern for the background `watch` process:
 
 ## Multi-Tab Behavior (Phase 9.1+)
 
-By default, `send` and `query` create a **new browser tab** for each session.
-This isolates conversations and prevents context contamination.
-
-### Tab Reuse
-
-Reuse the existing active tab (legacy single-tab behavior):
-
-```bash
-agbrowse web-ai send --vendor chatgpt --reuse-tab --inline-only --prompt "hello"
-# or globally:
-export AGBROWSE_REUSE_TAB=1
-```
+Every new `send` or `query` creates a fresh provider tab. Existing provider
+tabs are never scanned, borrowed, or checked out for another session.
 
 ### Session-to-Tab Binding
 
-Each session record stores `targetId`, `tabId`, and `tabState`. When `poll` or
-`stop` is invoked with `--session <id>`, the runtime switches to that session's
-bound tab automatically. If the tab was closed, it auto-recovers by creating a
-new tab and navigating to the saved `conversationUrl`.
+Each session stores the exact CDP `targetId` it owns. Always retain the
+`sessionId` returned by `send` and pass it to every later stateful command:
 
-### Shared CDP Session Ambiguity
+```bash
+agbrowse web-ai poll --session "$SID" --json
+agbrowse web-ai snapshot --session "$SID" --json
+agbrowse web-ai stop --session "$SID" --json
+```
 
-All provider commands may share one Chrome CDP port, such as `9222`. For
-session-less `poll` or `stop`: `0` active sessions preserve legacy current-tab
-behavior, `1` active provider session auto-binds with a warning, and `2+` fail
-closed with `session.target-ambiguous` plus candidate `sessionId`/`targetId`
-evidence. Rerun with `--session <id>`; for tab drift or missing target recovery,
-add `--navigate`.
+`poll`, `stop`, `watch`, and `snapshot` reject calls without `--session`. They
+never inspect the active tab, tab index, provider origin, or most-recent tab.
+Changing the visible Chrome tab therefore cannot change their target.
 
-### Tab Pooling (Phase 9.2)
+Multiple agents may share one Chrome/CDP port as long as each keeps its own
+returned `sessionId`. A closed target may be recreated only from that same
+session's persisted conversation URL; agbrowse never attaches the session to a
+different existing provider tab.
 
-Completed session tabs are kept in a vendor-specific pool for reuse. The next
-`send` for the same vendor will reuse a pooled tab instead of creating a new one,
-reducing tab creation overhead in batch scenarios.
-
-| Pool setting | Default | Env Var |
-| --- | --- | --- |
-| TTL per pooled tab | 30 min | `AGBROWSE_PROVIDER_POOL_TTL` |
-| Max warm tabs per `(owner,vendor,sessionType,origin,profile)` | 3 | `AGBROWSE_PROVIDER_POOL_MAX_PER_KEY` |
-| Global cap on warm provider tabs | 8 | `AGBROWSE_PROVIDER_POOL_GLOBAL_MAX` |
-
-Use `--new-tab` (or its alias `--parallel`) on `send` / `query` to bypass pool
-reuse for a single call — needed when you want a Pro query to run alongside
-another in-flight Pro query without lease contention.
+Completed tabs may remain until lifecycle cleanup, but they are not reusable by
+new sessions.
 
 ### Tab Lifecycle
 
@@ -840,8 +821,7 @@ Initial code catalog (full list and PR2 call-site coverage live in
   `provider.commit-not-verified`, `provider.poll-timeout`,
   `provider.runtime-disabled`
 - `capability.unsupported`
-- `session.target-ambiguous`: rerun `poll`/`stop` with `--session <id>`; for
-  target drift, retry `poll --session <id> --navigate`
+- `input.session-required`: pass the `sessionId` returned by `send`
 - `context.over-budget`, `context.symlink-rejected`,
   `context.transform-invalid`, `context.transform-failed`
 - `grok.context-pack-not-allowed`
@@ -858,5 +838,5 @@ provider/context-pack `throw new Error(` to `WebAiError`.
 - agbrowse does not bypass anti-bot, captcha, or Cloudflare checks.
 - Do not share one Chrome `--user-data-dir` across multiple CDP-controlled instances.
 - For agent integrations, prefer `AGBROWSE_JSON_ERRORS=1`.
-- If the active tab is ambiguous, run `agbrowse tabs` and
-  `agbrowse tab-switch <targetId>` before mutation.
+- For web-ai stateful commands, always pass `--session`; never tab-switch to
+  select a session target.

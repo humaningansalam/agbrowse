@@ -25,14 +25,11 @@ import { watchSession } from './watcher.mjs';
 import { buildWebAiSnapshot } from './ax-snapshot.mjs';
 import { runSessionsCommand, printSessionsHuman, parseDurationToMs } from './cli-sessions.mjs';
 import { isChatGptEffortSupported, normalizeChatGptEffortChoice, normalizeChatGptFamilyChoice } from './chatgpt-model.mjs';
-import { createTab, listManagedTabs, waitForPageByTargetId } from '../skills/browser/tab-manager.mjs';
-import { cleanupIdleTabs, isPinned, DEFAULT_MAX_TABS } from '../skills/browser/tab-lifecycle.mjs';
+import { createTab, waitForPageByTargetId } from '../skills/browser/tab-manager.mjs';
+import { cleanupIdleTabs, DEFAULT_MAX_TABS } from '../skills/browser/tab-lifecycle.mjs';
 import { resolveSessionPage, withSessionPage } from './tab-recovery.mjs';
 import { withSessionCommandLock } from './session-store.mjs';
-import { listSessions, getSession, resolvePollTimeoutSec, resolveTimeoutDefaultSec, expiredSessionTimeoutResult } from './session.mjs';
-import { resolveImplicitSessionSelection } from './session-target-guard.mjs';
-import { listLeases } from './tab-lease-store.mjs';
-import { cleanupPoolTabs, getPooledTab } from './tab-pool.mjs';
+import { getSession, resolvePollTimeoutSec, resolveTimeoutDefaultSec, expiredSessionTimeoutResult } from './session.mjs';
 import { finalizeProviderTab } from './tab-finalizer.mjs';
 import { runMcpServer } from './mcp-server.mjs';
 import { runWebAiEval } from './eval-runner.mjs';
@@ -41,9 +38,8 @@ import { writeCommandTrace } from './trace/writer.mjs';
 import { enforcePolicy } from './policy/enforce.mjs';
 import { loadPolicy } from './policy/schema.mjs';
 import { applyProviderDefaults } from './policy/default-policy.mjs';
-import { activeCommandTargetIds, withActiveCommand } from './active-command-store.mjs';
+import { withActiveCommand } from './active-command-store.mjs';
 import { auditSources } from './source-audit.mjs';
-import { isProviderPageDriveable, shouldNavigateToRequestedProviderUrl, waitForPageUrl } from './navigation-ready.mjs';
 export { parseDurationToMs };
 
 const VENDOR_DEFAULT_URLS = {
@@ -66,6 +62,7 @@ const COMMANDS = new Set([
 const FILE_ARTIFACT_COMMANDS = new Set(['send', 'query', 'poll', 'watch']);
 const BROWSER_REQUIRED_COMMANDS = new Set(['status', 'send', 'poll', 'query', 'stop', 'watch', 'snapshot', 'doctor', 'project-sources', 'code', 'code-extract']);
 const BROWSER_REQUIRED_SESSION_COMMANDS = new Set(['resume', 'reattach', 'doctor']);
+const EXPLICIT_SESSION_COMMANDS = new Set(['poll', 'stop', 'watch', 'snapshot']);
 export const WEB_AI_USAGE = `
 Usage:
   agbrowse web-ai <command> --vendor <chatgpt|gemini|grok> [options]
@@ -80,18 +77,13 @@ Agent skill setup:
 
 Commands:
   render              Render the prompt envelope without opening a browser
-  status              Check active provider tab state
+  status              Check provider tab state; --session checks its bound tab
   send                Send a prompt; returns a sessionId for later resume
-  poll                Poll a session for completion. Without --session:
-                      0 active sessions use the current baseline/tab, 1 active
-                      provider session auto-binds, 2+ fail closed with candidates.
+  poll                Poll a session for completion; requires --session
   query               send + poll in one call
-  stop                Interrupt generation. stop --session <id> targets that
-                      session-bound tab even while a poll is running; without
-                      --session: 0 active uses current tab, 1 active auto-binds,
-                      2+ active provider sessions fail closed.
+  stop                Interrupt generation on the bound tab; requires --session
   watch               Watch a persisted session until terminal status
-  snapshot            Print a compact accessibility snapshot for the active provider tab
+  snapshot            Snapshot the bound provider tab; requires --session
   sessions <sub>      Manage persisted sessions: list | show | resume | reattach | doctor | prune
   context-dry-run     Build a context package without sending
   context-render      Render full prompt/context package text
@@ -227,40 +219,34 @@ Attachments and context:
   --unsafe-allow <name>             Explicit unsafe allowance; repeatable
 
 Sessions (durable across shells, stored at $BROWSER_AGENT_HOME/web-ai-sessions.json):
-  --session <id>      Resume a session by id on poll / query / stop.
-                      Resolution priority: --session > active target id >
-                      vendor latest > legacy baseline.
+  --session <id>      Resolve the exact targetId stored for that session.
                       query --session <id> sends a new prompt in the same
                       saved conversation tab; poll/sessions resume only wait
                       for an already-sent response.
-                      For shared CDP ports, pass --session when multiple active
-                      provider sessions exist; ambiguity errors include
-                      candidates: [{ sessionId, targetId, vendor, conversationUrl }].
+                      poll / stop / watch / snapshot require this flag and never
+                      inspect the browser's active tab.
   --deadline <iso>    Override the session deadline (default now + --timeout
                       or the vendor polling default).
   --navigate          When sessions reattach finds a tab mismatch, allow
                       the runtime to switch tabs to the saved conversationUrl.
-  --new-tab           Force a fresh provider tab for this send/query
-                      (default reuses pooled or inactive provider tabs first)
-  --parallel          Alias for --new-tab. Use when you want to run a Pro
-                      query without contending with another in-flight one.
-  --reuse-tab         Reuse the existing active tab (legacy single-tab behavior)
+  --new-tab           Compatibility flag; new sessions always get a fresh tab
+  --parallel          Alias for --new-tab
 
 Browser:
   Provider commands auto-start headed Chrome when CDP is not running.
   Set AGBROWSE_WEB_AI_AUTO_START=0 to fail closed instead.
   Existing headless CDP sessions are rejected; restart with "agbrowse start --headed".
 
-Tab lease policy:
-  Completed provider tabs are runtime leases, not history storage.
-  Pool defaults: maxPerKey=3, globalMax=8, TTL=30m. Per-key limit is the
-  number of warm pooled tabs allowed per
-  (owner,vendor,sessionType,origin,profile). Override via
+Tab ownership policy:
+  One session owns one targetId. New sessions never scan, borrow, or reuse an
+  existing provider tab. Completed tabs may remain as cleanup leases, but are
+  never checked out to another session.
+  Retention defaults: maxPerKey=3, globalMax=8, TTL=30m. Override via
   AGBROWSE_PROVIDER_POOL_MAX_PER_KEY / _GLOBAL_MAX / _TTL.
   Active session caps default to per-key=5 and global=14. Override via
   AGBROWSE_PROVIDER_ACTIVE_MAX_PER_KEY / _GLOBAL_MAX.
-  Expired or overflow pooled tabs are closed with CDP.
-  Use --new-tab / --parallel to bypass pool reuse for a single call.
+  Expired or overflow completed tabs are closed with CDP; their session can
+  recover only from its own persisted conversation URL.
   Use "agbrowse tab-cleanup --json" to inspect leaseClosedTabs.
 
 Sessions subcommands:
@@ -278,8 +264,8 @@ Watcher:
                       One watcher per session is enforced by a lock file.
 
 Snapshot:
-  agbrowse web-ai snapshot --vendor <v> [--interactive] [--compact] [--json]
-                      Compact Playwright-MCP-style accessibility snapshot.
+  agbrowse web-ai snapshot --session <id> [--interactive] [--compact] [--json]
+                      Snapshot the exact targetId bound to the session.
 
 Project Sources:
   agbrowse web-ai project-sources list --chatgpt-url <project-url> [--json]
@@ -323,7 +309,7 @@ Failure envelope (when --json or AGBROWSE_JSON_ERRORS=1):
          provider.attachment-preflight | provider.attachment-evidence-missing |
          provider.commit-not-verified | provider.poll-timeout |
          provider.runtime-disabled | capability.unsupported |
-         session.target-ambiguous |
+         input.session-required |
          watcher.session-missing | watcher.already-running |
          snapshot.unavailable | snapshot.ref-stale |
          context.over-budget | context.symlink-rejected |
@@ -801,8 +787,7 @@ async function runWebAiCliInner(argv = [], deps) {
         snapshotOption: values.snapshot,
         maxDepth: values['max-depth'],
         rootSelector: values['root-selector'],
-        forceNewTab: values['new-tab'] === true || values.parallel === true,
-        newTab: values['new-tab'] === true || values.parallel === true || (['send', 'query', 'code'].includes(command) && values['reuse-tab'] !== true && !values.session && process.env.AGBROWSE_REUSE_TAB !== '1'),
+        newTab: ['send', 'query', 'code'].includes(command) && !values.session,
         reuseTab: values['reuse-tab'] === true || process.env.AGBROWSE_REUSE_TAB === '1',
         evalConfig: values.config,
         evalFixtures: values.fixtures,
@@ -814,6 +799,7 @@ async function runWebAiCliInner(argv = [], deps) {
         unsafeAllow: values['unsafe-allow'] || [],
     };
 
+    enforceStrictSessionTargeting(command, input);
     validateCodeModeCliInput(command, input);
     const repomixContextProvider = (
         ['render', 'send', 'query', 'code'].includes(command) &&
@@ -858,7 +844,7 @@ async function runWebAiCliInner(argv = [], deps) {
         const port = Number(deps?.getPort?.() || process.env.CDP_PORT || 9222);
         emitControlSummary({
             cdpPort: port,
-            tabSource: input.newTab ? 'new-tab' : input.reuseTab ? 'active' : 'pooled',
+            tabSource: input.session ? 'session-target' : input.newTab ? 'new-tab' : 'active',
             sessionReuse: !!input.session,
             recoveryUrl: typeof input.url === 'string' ? input.url : undefined,
             chromeVisible: true,
@@ -1191,6 +1177,35 @@ function isContextCommand(command) {
 }
 
 /**
+ * Stateful reads and interrupts must resolve one persisted session, never the
+ * browser's active tab. New provider conversations likewise always get a new
+ * target; legacy active-tab reuse cannot be made deterministic under shared CDP.
+ * @param {string} command
+ * @param {any} input
+ */
+function enforceStrictSessionTargeting(command, input) {
+    if (EXPLICIT_SESSION_COMMANDS.has(command) && !input.session) {
+        throw new WebAiError({
+            errorCode: 'input.session-required',
+            stage: 'input-preflight',
+            retryHint: 'pass-session',
+            message: `web-ai ${command} requires --session <sessionId>`,
+            mutationAllowed: false,
+            evidence: { command },
+        });
+    }
+    if (['send', 'query', 'code'].includes(command) && !input.session && input.reuseTab) {
+        throw new WebAiError({
+            errorCode: 'capability.unsupported',
+            stage: 'target-resolution',
+            retryHint: 'use-new-session-tab',
+            message: '--reuse-tab and AGBROWSE_REUSE_TAB are disabled for new web-ai sessions; each session owns a fresh target',
+            mutationAllowed: false,
+        });
+    }
+}
+
+/**
  * @param {any} deps
  * @param {any} input
  */
@@ -1199,30 +1214,10 @@ async function ensureProviderTab(deps, input) {
     const vendorUrl = input.url || (/** @type {any} */ (VENDOR_DEFAULT_URLS))[input.vendor || 'chatgpt'];
     const port = deps.getPort?.() || 9222;
 
-    await cleanupPoolTabs(port);
     await cleanupIdleTabs(port, { maxTabs: DEFAULT_MAX_TABS });
 
-    if (input.forceNewTab !== true) {
-        // Phase 9.2: try tab pool first
-        const pooled = await getPooledTab(port, input.vendor || 'chatgpt', /** @type {any} */ ({
-            owner: 'web-ai',
-            sessionType: 'send-poll',
-            url: vendorUrl,
-            port: port,
-        }));
-        if (pooled && !shouldNavigateToRequestedProviderUrl(pooled.url, vendorUrl)) {
-            const bound = await bindReusableProviderPage(deps, port, pooled, vendorUrl);
-            if (bound) return bound;
-        }
-
-        const reusable = await findReusableProviderTab(port, input.vendor || 'chatgpt', vendorUrl);
-        if (reusable) {
-            const bound = await bindReusableProviderPage(deps, port, reusable, vendorUrl);
-            if (bound) return bound;
-        }
-    }
-
-    // Phase 9.1 fix: create tab WITHOUT activate (avoids focus race)
+    // One new logical session owns one fresh CDP target. Do not inspect or
+    // borrow any existing provider tab; active-tab state is irrelevant.
     const tab = await createTab(port, vendorUrl, { activate: false, reuseBlank: false });
     const page = await waitForPageByTargetId(port, tab.targetId);
     return {
@@ -1237,102 +1232,6 @@ async function ensureProviderTab(deps, input) {
 }
 
 /**
- * @param {any} deps
- * @param {any} page
- * @param {any} targetId
- * @param {any} vendorUrl
- */
-function bindProviderPage(deps, page, targetId, vendorUrl) {
-    return {
-        ...deps,
-        getPage: async () => {
-            if (page.isClosed?.()) throw new Error(`bound tab closed: ${targetId}`);
-            return page;
-        },
-        getTargetId: async () => targetId,
-        getCdpSession: async () => (/** @type {any} */ (page)).context().newCDPSession(page),
-        prepareProviderPage: async () => {
-            const currentUrl = await waitForPageUrl(page);
-            if (shouldNavigateToRequestedProviderUrl(currentUrl, vendorUrl)) {
-                await page.goto(vendorUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-                // SPA providers render the composer asynchronously after DOMContentLoaded
-                await page.locator('#prompt-textarea, .ProseMirror, [contenteditable="true"]').first()
-                    .waitFor({ state: 'visible', timeout: 15_000 })
-                    .catch(() => undefined);
-            }
-        },
-    };
-}
-
-/**
- * @param {any} deps
- * @param {number} port
- * @param {{ targetId?: string }} tab
- * @param {string} vendorUrl
- */
-async function bindReusableProviderPage(deps, port, tab, vendorUrl) {
-    if (!tab?.targetId) return null;
-    const page = await waitForPageByTargetId(port, tab.targetId).catch(() => null);
-    if (!page) return null;
-    if (!await isProviderPageDriveable(page, vendorUrl)) return null;
-    return bindProviderPage(deps, page, tab.targetId, vendorUrl);
-}
-
-/**
- * @param {any} port
- * @param {any} vendor
- * @param {any} targetUrl
- */
-async function findReusableProviderTab(port, vendor, targetUrl) {
-    const origin = providerOrigin(vendor, targetUrl);
-    if (!origin) return null;
-    const activeTargets = await activeCommandTargetIds({ browserProfileKey: String(port) });
-    const activeSessionTargets = new Set(listSessions({ active: true }).map(session => session.targetId).filter(Boolean));
-    const leases = await listLeases();
-    const leaseByTargetId = new Map(leases.map(lease => [lease.targetId, lease]));
-    const tabs = await listManagedTabs(port);
-    return tabs
-        .filter(tab => tab?.targetId && tab.type === 'page')
-        .filter(tab => !activeTargets.has(tab.targetId))
-        .filter(tab => !activeSessionTargets.has(tab.targetId))
-        .filter(tab => !isPinned(tab.targetId))
-        .filter(tab => isReusableByLease(tab.targetId, leaseByTargetId))
-        .filter(tab => providerOriginFromUrl(tab.url) === origin)
-        .filter(tab => !shouldNavigateToRequestedProviderUrl(tab.url, targetUrl))
-        .sort((a, b) => (Number(b.lastActiveAt) || 0) - (Number(a.lastActiveAt) || 0))[0] || null;
-}
-
-/**
- * @param {any} targetId
- * @param {any} leaseByTargetId
- */
-function isReusableByLease(targetId, leaseByTargetId) {
-    const lease = leaseByTargetId.get(targetId);
-    if (!lease) return true;
-    return ['web-ai', 'cli-jaw'].includes(lease.owner) &&
-        ['pooled', 'completed-session'].includes(lease.state);
-}
-
-/**
- * @param {any} vendor
- * @param {any} fallbackUrl
- */
-function providerOrigin(vendor, fallbackUrl = '') {
-    return providerOriginFromUrl(fallbackUrl || (/** @type {any} */ (VENDOR_DEFAULT_URLS))[vendor] || '');
-}
-
-/**
- * @param {any} url
- */
-function providerOriginFromUrl(url = '') {
-    try {
-        return new URL(url).origin;
-    } catch {
-        return null;
-    }
-}
-
-/**
  * @param {any} command
  * @param {any} deps
  * @param {any} input
@@ -1340,95 +1239,48 @@ function providerOriginFromUrl(url = '') {
  * @param {any} stopFn
  */
 async function runBoundCommand(command, deps, input, pollFn, stopFn) {
-    input = resolveImplicitCommandSession(command, deps, input);
-    if (command === 'stop' && input.session) {
+    if (command === 'stop') {
         return runSessionStopInterrupt(deps, input, stopFn);
     }
-    if (command === 'poll' && input.session) {
-        // Refuse an expired session BEFORE resolving its page. The clamp keeps
-        // a positive minimum so providers cannot read it as "no budget", which
-        // means an expired session would otherwise still open a tab and take at
-        // least one probe — and Gemini's placeholder branch waits five seconds.
-        // `pollWebAi` already refuses on its own; this covers every vendor.
-        const expiredBeforeLock = expiredSessionTimeoutResult(input.session, input.vendor || 'chatgpt');
-        if (expiredBeforeLock) return expiredBeforeLock;
-        return withSessionCommandLock(input.session, async () => {
-            // Re-checked inside the lock. Acquiring it retries 200 times at
-            // 25ms, so a session with 150ms left can expire while waiting and
-            // the pre-lock check alone would still open a tab.
-            const expiredInLock = expiredSessionTimeoutResult(input.session, input.vendor || 'chatgpt');
-            if (expiredInLock) return expiredInLock;
-            return withCommandSessionPage(command, deps, input, async ({ page, targetId, session }) => {
-                const effectivePollFn = isWorkSession(session) ? pollWorkSession : pollFn;
-                const sessionDeps = {
-                    ...deps,
-                    getPage: async () => page,
-                    getTargetId: async () => targetId,
-                    getCdpSession: async () => (/** @type {any} */ (page)).context().newCDPSession(page),
-                };
-                return withWebAiActiveCommand(command, sessionDeps, { ...input, vendor: session.vendor, session: session.sessionId }, async () => {
-                    const result = await effectivePollFn(sessionDeps, {
-                        ...input,
-                        vendor: session.vendor,
-                        session: session.sessionId,
-                        // Bounded like every other resume surface. Forwarding the
-                        // raw input meant an omitted timeout fell through to a
-                        // provider default — 1200s for Gemini, 600s for Grok —
-                        // and an explicit one was never clamped to the stored
-                        // deadline. ChatGPT reads `deadlineAt` itself, but the
-                        // other providers do not.
-                        timeout: resolvePollTimeoutSec(input, session, session.vendor || 'chatgpt'),
-                    });
-                    if (isRecoverableTabCrash(result)) {
-                        throw new Error(result.error || 'target closed during session-bound web-ai command');
-                    }
-                    return appendAutoBindWarning(result, input, session);
+    if (command === 'poll') {
+        // Poll observes one already-bound target. Do not hold the mutation
+        // command lock for the whole long poll; target ownership is enforced by
+        // the active-command row below, whose owner PID is reclaimable on death.
+        const expiredBeforeResolve = expiredSessionTimeoutResult(input.session, input.vendor || 'chatgpt');
+        if (expiredBeforeResolve) return expiredBeforeResolve;
+        return withSessionPage(deps, input.session, async ({ page, targetId, session }) => {
+            const expiredAfterResolve = expiredSessionTimeoutResult(input.session, session.vendor || 'chatgpt');
+            if (expiredAfterResolve) return expiredAfterResolve;
+            const effectivePollFn = isWorkSession(session) ? pollWorkSession : pollFn;
+            const sessionDeps = {
+                ...deps,
+                getPage: async () => page,
+                getTargetId: async () => targetId,
+                getCdpSession: async () => (/** @type {any} */ (page)).context().newCDPSession(page),
+            };
+            return withWebAiActiveCommand(command, sessionDeps, { ...input, vendor: session.vendor, session: session.sessionId }, async () => {
+                const expiredBeforePoll = expiredSessionTimeoutResult(input.session, session.vendor || 'chatgpt');
+                if (expiredBeforePoll) return expiredBeforePoll;
+                const result = await effectivePollFn(sessionDeps, {
+                    ...input,
+                    vendor: session.vendor,
+                    session: session.sessionId,
+                    // Bounded like every other resume surface. Forwarding the
+                    // raw input meant an omitted timeout fell through to a
+                    // provider default — 1200s for Gemini, 600s for Grok —
+                    // and an explicit one was never clamped to the stored
+                    // deadline. ChatGPT reads `deadlineAt` itself, but the
+                    // other providers do not.
+                    timeout: resolvePollTimeoutSec(input, session, session.vendor || 'chatgpt'),
                 });
+                if (isRecoverableTabCrash(result)) {
+                    throw new Error(result.error || 'target closed during session-bound web-ai command');
+                }
+                return result;
             });
         });
     }
-    if (command === 'poll') return withWebAiActiveCommand(command, deps, input, () => pollFn(deps, input));
-    if (command === 'stop') return withWebAiActiveCommand(command, deps, input, () => stopFn(deps, input));
     throw new Error(`runBoundCommand: unsupported command ${command}`);
-}
-
-/**
- * @param {any} command
- * @param {any} deps
- * @param {any} input
- */
-function resolveImplicitCommandSession(command, deps, input) {
-    if (input.session || !['poll', 'stop'].includes(command)) return input;
-    const port = Number(deps.getPort?.() || process.env.CDP_PORT || 9222);
-    const selection = resolveImplicitSessionSelection({
-        command,
-        vendor: input.vendor || 'chatgpt',
-        port,
-    });
-    if (selection.action !== 'auto-bind' || !selection.sessionId) return input;
-    return {
-        ...input,
-        session: selection.sessionId,
-        autoBoundSession: true,
-        autoBoundCandidates: selection.candidates,
-    };
-}
-
-/**
- * @template T
- * @param {any} command
- * @param {any} deps
- * @param {any} input
- * @param {(ctx: { page: any, targetId: string, session: any }) => Promise<T>} fn
- * @returns {Promise<T>}
- */
-async function withCommandSessionPage(command, deps, input, fn) {
-    if (input.autoBoundSession === true) {
-        const resolved = await resolveSessionPage(deps, input.session, { allowNavigate: input.navigate === true });
-        if (resolved.mismatch) throw sessionResolutionError(command, deps, input, resolved);
-        return fn({ page: resolved.page, targetId: resolved.targetId, session: resolved.session });
-    }
-    return withSessionPage(deps, input.session, fn);
 }
 
 /**
@@ -1450,12 +1302,12 @@ async function runSessionStopInterrupt(deps, input, stopFn) {
         vendor: resolved.session.vendor,
         session: resolved.session.sessionId,
     });
-    return appendAutoBindWarning({
+    return {
         ...result,
         sessionId: resolved.session.sessionId,
         targetId: resolved.targetId,
         interrupt: true,
-    }, input, resolved.session);
+    };
 }
 
 /**
@@ -1520,22 +1372,6 @@ function sessionResolutionError(command, deps, input, resolved) {
             warnings: resolved.warnings || [],
         },
     });
-}
-
-/**
- * @param {any} result
- * @param {any} input
- * @param {any} session
- */
-function appendAutoBindWarning(result, input, session) {
-    if (input.autoBoundSession !== true) return result;
-    return {
-        ...result,
-        warnings: [
-            ...(result.warnings || []),
-            `auto-bound ${input.vendor || session.vendor || 'web-ai'} session ${input.session} because it was the only active provider session`,
-        ],
-    };
 }
 
 /**
@@ -1624,7 +1460,7 @@ async function runCommand(command, deps, input) {
     if (input.vendor === 'gemini') {
         switch (command) {
             case 'render': return renderWebAi(input);
-            case 'status': return geminiStatusWebAi(deps, input);
+            case 'status': return runStatusCommand(deps, input, geminiStatusWebAi);
             case 'send': return withWebAiActiveCommand(command, deps, input, () => geminiSendWebAi(deps, input));
             case 'poll': return runBoundCommand(command, deps, input, geminiPollWebAi, geminiStopWebAi);
             case 'query': return withWebAiActiveCommand(command, deps, input, () => geminiQueryWebAi(deps, input));
@@ -1635,7 +1471,7 @@ async function runCommand(command, deps, input) {
     if (input.vendor === 'grok') {
         switch (command) {
             case 'render': return renderWebAi(input);
-            case 'status': return grokStatusWebAi(deps, input);
+            case 'status': return runStatusCommand(deps, input, grokStatusWebAi);
             case 'send': return withWebAiActiveCommand(command, deps, input, () => grokSendWebAi(deps, input));
             case 'poll': return runBoundCommand(command, deps, input, grokPollWebAi, grokStopWebAi);
             case 'query': return withWebAiActiveCommand(command, deps, input, () => grokQueryWebAi(deps, input));
@@ -1645,7 +1481,7 @@ async function runCommand(command, deps, input) {
     }
     switch (command) {
         case 'render': return renderWebAi(input);
-        case 'status': return statusWebAi(deps, input);
+        case 'status': return runStatusCommand(deps, input, statusWebAi);
         case 'send': return withWebAiActiveCommand(command, deps, input, () => sendWebAi(deps, input));
         case 'poll': return runBoundCommand(command, deps, input, pollWebAi, stopWebAi);
         case 'query': return withWebAiActiveCommand(command, deps, input, async () => {
@@ -1719,11 +1555,41 @@ async function runCodeExtractCommand(deps, input) {
 }
 
 /**
+ * Status may be used before a session exists. Once --session is supplied it
+ * must inspect that session's exact target, regardless of the browser's active
+ * tab.
+ * @param {any} deps
+ * @param {any} input
+ * @param {(deps: any, input: any) => Promise<any>} statusFn
+ */
+async function runStatusCommand(deps, input, statusFn) {
+    if (!input.session) return statusFn(deps, input);
+    const resolved = await resolveSessionPage(deps, input.session, { allowNavigate: input.navigate === true });
+    if (resolved.mismatch) throw sessionResolutionError('status', deps, input, resolved);
+    const sessionDeps = {
+        ...deps,
+        getPage: async () => resolved.page,
+        getTargetId: async () => resolved.targetId,
+        getCdpSession: async () => (/** @type {any} */ (resolved.page)).context().newCDPSession(resolved.page),
+    };
+    const result = await statusFn(sessionDeps, {
+        ...input,
+        vendor: resolved.session.vendor,
+        session: resolved.session.sessionId,
+    });
+    return {
+        ...result,
+        sessionId: resolved.session.sessionId,
+        targetId: resolved.targetId,
+    };
+}
+
+/**
  * @param {any} command
  * @param {any} input
  */
 function resolveSessionVendorInput(command, input) {
-    if (!['poll', 'stop'].includes(command) || !input.session) return input;
+    if (!['poll', 'stop', 'status'].includes(command) || !input.session) return input;
     const session = getSession(input.session);
     if (!session?.vendor || session.vendor === input.vendor) return input;
     return { ...input, vendor: session.vendor, sessionVendorResolved: true };
@@ -1977,14 +1843,21 @@ function printDoctorHuman(report) {
  * @param {any} values
  */
 async function runSnapshotCommand(deps, input, values) {
-    const page = await deps.getPage();
-    return buildWebAiSnapshot(page, {
-        provider: input.vendor,
+    const resolved = await resolveSessionPage(deps, input.session, { allowNavigate: input.navigate === true });
+    if (resolved.mismatch) throw sessionResolutionError('snapshot', deps, input, resolved);
+    const snapshot = await buildWebAiSnapshot(resolved.page, {
+        provider: resolved.session.vendor,
         compact: values.compact !== false,
         interactiveOnly: values.interactive !== false,
         maxDepth: values['max-depth'] ? Number(values['max-depth']) : 6,
         rootSelector: values['root-selector'] || null,
     });
+    return {
+        ...snapshot,
+        sessionId: resolved.session.sessionId,
+        targetId: resolved.targetId,
+        vendor: resolved.session.vendor,
+    };
 }
 
 /**

@@ -14,6 +14,7 @@ import { generateSessionId } from './session-store.mjs';
  *   sessionId: string|null,
  *   targetId: string|null,
  *   owner: string,
+ *   pid: number|null,
  *   browserProfileKey: string,
  *   startedAt: string,
  *   heartbeatAt: string,
@@ -145,10 +146,9 @@ export async function registerActiveCommand(input = {}) {
         let changed = false;
         store.commands = store.commands.map(row => {
             if (row.status !== 'running') return row;
-            const expiresMs = Date.parse(row.expiresAt || '');
-            if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) {
+            if (isActiveCommandStale(row, nowMs)) {
                 changed = true;
-                return { ...row, status: 'expired', completedAt: new Date(nowMs).toISOString() };
+                return { ...row, status: 'stale', completedAt: new Date(nowMs).toISOString() };
             }
             return row;
         });
@@ -217,7 +217,7 @@ export async function listActiveCommands(filter = {}) {
         const store = readStore();
         let changed = false;
         let commands = store.commands.map(row => {
-            if (row.status === 'running' && Date.parse(row.expiresAt || '') <= now) {
+            if (row.status === 'running' && isActiveCommandStale(row, now)) {
                 changed = true;
                 return { ...row, status: 'stale' };
             }
@@ -295,10 +295,35 @@ function normalizeActiveCommand(input = {}) {
         sessionId: input.sessionId || null,
         targetId: input.targetId || null,
         owner: input.owner || 'cli',
+        pid: Number.isFinite(Number(input.pid)) && Number(input.pid) > 0 ? Number(input.pid) : process.pid,
         browserProfileKey: String(input.browserProfileKey || input.port || process.env.CDP_PORT || '9222'),
         startedAt: /** @type {string} */ (input.startedAt),
         heartbeatAt: /** @type {string} */ (input.heartbeatAt),
         expiresAt: /** @type {string} */ (input.expiresAt),
         status: input.status || 'running',
     };
+}
+
+/**
+ * A command owner that no longer exists cannot retain a target until TTL.
+ * Rows written by older versions have no PID, so they keep the legacy expiry
+ * behavior instead of being stolen while an old process may still be alive.
+ * @param {Partial<ActiveCommandRow>} row
+ * @param {number} nowMs
+ */
+function isActiveCommandStale(row, nowMs) {
+    const expiresMs = Date.parse(row.expiresAt || '');
+    if (!Number.isFinite(expiresMs) || expiresMs <= nowMs) return true;
+    const pid = Number(row.pid);
+    return Number.isFinite(pid) && pid > 0 && !pidAlive(pid);
+}
+
+/** @param {number} pid */
+function pidAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return (/** @type {NodeJS.ErrnoException} */ (error))?.code === 'EPERM';
+    }
 }
