@@ -230,6 +230,20 @@ describe('web-ai session command lock heartbeat + PID staleness', () => {
         }, { ttlMs: 60_000, heartbeatMs: 0 });
         await lockPromise;
     });
+
+    it('does not steal a command lock from a live owner after its ttl timestamp passes', async () => {
+        const { withSessionCommandLock, readSessionCommandLock } = await freshStore();
+        const sessionId = 'TESTSESSION004';
+        await withSessionCommandLock(sessionId, async () => {
+            await new Promise(resolve => setTimeout(resolve, 30));
+            expect(readSessionCommandLock(sessionId)).toMatchObject({
+                pid: process.pid,
+                stale: false,
+            });
+        }, { ttlMs: 10, heartbeatMs: 0 });
+        expect(readSessionCommandLock(sessionId)).toBeNull();
+    });
+
 });
 
 describe('web-ai session-store concurrency', () => {

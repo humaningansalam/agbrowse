@@ -25,7 +25,8 @@ describe('deadline-aware tab finalizer writes', () => {
     it('keeps writes and external phases in finalization order', async () => {
         const calls = [];
         const DEADLINE_PASSED = Symbol('deadline');
-        const updateSessionAsync = vi.fn(async (_id, patch) => {
+        const GENERATION_CHANGED = Symbol('generation');
+        const updateSessionForGeneration = vi.fn(async (_id, _generation, patch) => {
             calls.push(patch.archived ? 'archived-write' : 'complete-write');
             return {};
         });
@@ -33,7 +34,13 @@ describe('deadline-aware tab finalizer writes', () => {
         const archiveConversation = vi.fn(async () => { calls.push('archive'); return { ok: true }; });
         const poolTab = vi.fn(async () => { calls.push('pool'); return { pooled: true }; });
 
-        vi.doMock('../../web-ai/session.mjs', () => ({ updateSessionAsync, DEADLINE_PASSED }));
+        vi.doMock('../../web-ai/session.mjs', () => ({
+            DEADLINE_PASSED,
+            GENERATION_CHANGED,
+            sessionGeneration: () => 1,
+            isSessionGenerationCurrent: async () => true,
+            updateSessionForGeneration,
+        }));
         vi.doMock('../../web-ai/session-artifacts.mjs', () => ({
             trySaveTranscript: () => ({ ok: true, descriptor: descriptor('transcript', 'transcript.md', 1) }),
             appendArtifactRecordAsync,
@@ -54,9 +61,13 @@ describe('deadline-aware tab finalizer writes', () => {
     it('reaches pooling only after the complete, artifact, and archive phases', async () => {
         const calls = [];
         const DEADLINE_PASSED = Symbol('deadline');
+        const GENERATION_CHANGED = Symbol('generation');
         vi.doMock('../../web-ai/session.mjs', () => ({
             DEADLINE_PASSED,
-            updateSessionAsync: vi.fn(async () => { calls.push('complete-write'); return {}; }),
+            GENERATION_CHANGED,
+            sessionGeneration: () => 1,
+            isSessionGenerationCurrent: async () => true,
+            updateSessionForGeneration: vi.fn(async () => { calls.push('complete-write'); return {}; }),
         }));
         vi.doMock('../../web-ai/session-artifacts.mjs', () => ({
             trySaveTranscript: () => ({ ok: true, descriptor: descriptor('transcript', 'transcript.md', 1) }),
@@ -79,7 +90,8 @@ describe('deadline-aware tab finalizer writes', () => {
     it('stops after the complete write when the deadline crosses there', async () => {
         let active = true;
         const DEADLINE_PASSED = Symbol('deadline');
-        const updateSessionAsync = vi.fn(async () => {
+        const GENERATION_CHANGED = Symbol('generation');
+        const updateSessionForGeneration = vi.fn(async () => {
             active = false;
             return {};
         });
@@ -88,7 +100,13 @@ describe('deadline-aware tab finalizer writes', () => {
         const poolTab = vi.fn();
         const trySaveTranscript = vi.fn();
 
-        vi.doMock('../../web-ai/session.mjs', () => ({ updateSessionAsync, DEADLINE_PASSED }));
+        vi.doMock('../../web-ai/session.mjs', () => ({
+            DEADLINE_PASSED,
+            GENERATION_CHANGED,
+            sessionGeneration: () => 1,
+            isSessionGenerationCurrent: async () => true,
+            updateSessionForGeneration,
+        }));
         vi.doMock('../../web-ai/session-artifacts.mjs', () => ({ trySaveTranscript, appendArtifactRecordAsync }));
         vi.doMock('../../web-ai/chatgpt-archive.mjs', () => ({
             resolveArchivePolicy: vi.fn(() => ({ shouldArchive: true })),
@@ -104,7 +122,7 @@ describe('deadline-aware tab finalizer writes', () => {
             pool: null,
             archiveSkippedReason: 'poll-deadline-exceeded',
         });
-        expect(updateSessionAsync).toHaveBeenCalledTimes(1);
+        expect(updateSessionForGeneration).toHaveBeenCalledTimes(1);
         expect(trySaveTranscript).not.toHaveBeenCalled();
         expect(appendArtifactRecordAsync).not.toHaveBeenCalled();
         expect(archiveConversation).not.toHaveBeenCalled();

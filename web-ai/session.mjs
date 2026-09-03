@@ -9,18 +9,53 @@ import {
     listStoredSessions,
     listStoredSessionsAsync,
     mutateSessionAsync,
-    DEADLINE_PASSED,
     patchSession,
+    readSessionAsync,
+    DEADLINE_PASSED,
     pruneSessions,
 } from './session-store.mjs';
 import { normalizeChatGptModelChoice } from './chatgpt-model.mjs';
 import { normalizeGrokModelChoice } from './grok-model.mjs';
 import { normalizeGeminiModelChoice, isGeminiDeepThinkChoice } from './gemini-model.mjs';
-import { isDurableConversationUrl } from './conversation-url.mjs';
+import {
+    canonicalChatGptConversationUrl,
+    extractDurableConversationId,
+} from './conversation-url.mjs';
+import { WebAiError } from './errors.mjs';
 
 /**
  * @typedef {import('./session-store.mjs').WebAiSession} WebAiSession
  */
+
+/** Returned when an observer tries to write an older logical request. */
+export const GENERATION_CHANGED = Symbol('session-generation-changed');
+
+const COMPLETED_SESSION_STATUSES = new Set(['complete', 'completed']);
+
+/**
+ * Legacy rows are generation 1 until their first follow-up advances them.
+ *
+ * @param {WebAiSession|null|undefined} session
+ * @returns {number}
+ */
+export function sessionGeneration(session) {
+    const value = Number(session?.generation);
+    return Number.isInteger(value) && value > 0 ? value : 1;
+}
+
+/**
+ * Durable ChatGPT conversation identity, including legacy rows that only
+ * persisted a concrete conversation URL.
+ *
+ * @param {WebAiSession|null|undefined} session
+ * @returns {string|null}
+ */
+export function sessionConversationId(session) {
+    if (!session || session.vendor !== 'chatgpt') return null;
+    return typeof session.conversationId === 'string' && session.conversationId
+        ? session.conversationId
+        : extractDurableConversationId(session.conversationUrl);
+}
 
 /**
  * @typedef {{
@@ -207,15 +242,18 @@ function saveStore() {
 
 /**
  * @param {WebAiEnvelope|null|undefined} envelope
- * @param {{ vendor?: string, deadlineAt?: string|null, targetId?: string|null, tabId?: string|null, tabState?: Record<string, unknown>, originalUrl?: string|null, conversationUrl?: string|null, envelopeSummary?: Record<string, unknown> }} [meta]
+ * @param {{ vendor?: string, deadlineAt?: string|null, targetId?: string|null, tabId?: string|null, tabState?: Record<string, unknown>, originalUrl?: string|null, conversationUrl?: string|null, conversationId?: string|null, generation?: number, envelopeSummary?: Record<string, unknown> }} [meta]
  * @returns {WebAiSession}
  */
 export function createSession(envelope, meta = {}) {
     const now = new Date().toISOString();
     const vendor = envelope?.vendor || meta.vendor || null;
     const observedConversationUrl = meta.conversationUrl || meta.originalUrl || null;
+    const observedConversationId = vendor === 'chatgpt'
+        ? (meta.conversationId || extractDurableConversationId(observedConversationUrl))
+        : null;
     const conversationUrl = vendor === 'chatgpt'
-        ? (isDurableConversationUrl(observedConversationUrl) ? observedConversationUrl : null)
+        ? canonicalChatGptConversationUrl(observedConversationUrl)
         : observedConversationUrl;
     /** @type {WebAiSession} */
     const session = {
@@ -224,6 +262,9 @@ export function createSession(envelope, meta = {}) {
         createdAt: now,
         updatedAt: now,
         deadlineAt: meta.deadlineAt || null,
+        generation: Number.isInteger(meta.generation) && Number(meta.generation) > 0
+            ? Number(meta.generation)
+            : 1,
         targetId: meta.targetId || null,
         tabId: meta.tabId || null,
         tabState: meta.tabState || {
@@ -234,6 +275,11 @@ export function createSession(envelope, meta = {}) {
         },
         originalUrl: meta.originalUrl || null,
         conversationUrl,
+        conversationId: observedConversationId || null,
+        submittedUserMessageId: null,
+        submittedUserTurnId: null,
+        responseMessageId: null,
+        responseTurnId: null,
         promptHash: `sha256:${hashPrompt(envelope || {})}`,
         envelopeSummary: meta.envelopeSummary || {},
         status: 'sent',
@@ -256,17 +302,7 @@ export function createSession(envelope, meta = {}) {
  * @returns {WebAiSession|null}
  */
 export function updateSession(sessionId, patch = {}) {
-    const current = getSession(sessionId);
-    if (!current) return null;
-    const nextPatch = { ...patch };
-    if (
-        current.vendor === 'chatgpt' &&
-        Object.hasOwn(nextPatch, 'conversationUrl') &&
-        !isDurableConversationUrl(/** @type {string|null|undefined} */ (nextPatch.conversationUrl))
-    ) {
-        delete nextPatch.conversationUrl;
-    }
-    return patchSession(sessionId, { ...nextPatch, updatedAt: new Date().toISOString() });
+    return patchSession(sessionId, (current) => buildSessionPatch(current, patch));
 }
 
 /**
@@ -282,12 +318,54 @@ export function updateSession(sessionId, patch = {}) {
  */
 function buildSessionPatch(current, patch) {
     const nextPatch = { ...patch };
-    if (
-        current.vendor === 'chatgpt' &&
-        Object.hasOwn(nextPatch, 'conversationUrl') &&
-        !isDurableConversationUrl(/** @type {string|null|undefined} */ (nextPatch.conversationUrl))
-    ) {
-        delete nextPatch.conversationUrl;
+    if (current.vendor === 'chatgpt') {
+        const currentConversationId = sessionConversationId(current);
+        const requestedConversationId = typeof nextPatch.conversationId === 'string'
+            ? nextPatch.conversationId
+            : null;
+        if (
+            requestedConversationId &&
+            currentConversationId &&
+            requestedConversationId !== currentConversationId
+        ) {
+            throw conversationMismatchError(current, requestedConversationId, nextPatch.conversationUrl);
+        }
+        if (Object.hasOwn(nextPatch, 'conversationUrl')) {
+            const candidateUrl = /** @type {string|null|undefined} */ (nextPatch.conversationUrl);
+            const candidateConversationId = extractDurableConversationId(candidateUrl);
+            if (!candidateConversationId) {
+                delete nextPatch.conversationUrl;
+                delete nextPatch.conversationId;
+            } else if (currentConversationId && candidateConversationId !== currentConversationId) {
+                throw conversationMismatchError(current, candidateConversationId, candidateUrl);
+            } else {
+                nextPatch.conversationId = currentConversationId || candidateConversationId;
+                nextPatch.conversationUrl = canonicalChatGptConversationUrl(candidateUrl);
+            }
+        } else if (currentConversationId && !current.conversationId) {
+            nextPatch.conversationId = currentConversationId;
+        }
+    }
+
+    const requestedGeneration = Number(nextPatch.generation);
+    const startsNewGeneration = Number.isInteger(requestedGeneration)
+        && requestedGeneration > sessionGeneration(current);
+    const hasCompletedEvidence = COMPLETED_SESSION_STATUSES.has(current.status)
+        || Boolean(current.completedAt)
+        || current.answer != null;
+    if (hasCompletedEvidence && !startsNewGeneration) {
+        if (
+            Object.hasOwn(nextPatch, 'status') &&
+            !COMPLETED_SESSION_STATUSES.has(String(nextPatch.status || ''))
+        ) {
+            delete nextPatch.status;
+        }
+        if (Object.hasOwn(nextPatch, 'answer') && nextPatch.answer !== current.answer) {
+            delete nextPatch.answer;
+        }
+        if (Object.hasOwn(nextPatch, 'completedAt') && nextPatch.completedAt !== current.completedAt) {
+            delete nextPatch.completedAt;
+        }
     }
     return { ...nextPatch, updatedAt: new Date().toISOString() };
 }
@@ -309,6 +387,190 @@ function buildSessionPatch(current, patch) {
  */
 export function updateSessionAsync(sessionId, patch = {}, stillActive) {
     return mutateSessionAsync(sessionId, (current) => buildSessionPatch(current, patch), stillActive);
+}
+
+/**
+ * Start the next prompt inside an existing logical conversation. The session
+ * id, target binding and ChatGPT conversation identity remain stable; only the
+ * prompt generation and current-result fields advance.
+ *
+ * @param {string} sessionId
+ * @param {WebAiEnvelope|null|undefined} envelope
+ * @param {{ targetId?: string|null, conversationUrl?: string|null, deadlineAt?: string|null, envelopeSummary?: Record<string, unknown>, modelSelection?: unknown }} [meta]
+ * @returns {Promise<WebAiSession|null|typeof DEADLINE_PASSED>}
+ */
+export function beginSessionGeneration(sessionId, envelope, meta = {}) {
+    return mutateSessionAsync(sessionId, (current) => {
+        const vendor = envelope?.vendor || current.vendor;
+        if (vendor && current.vendor && vendor !== current.vendor) {
+            throw new WebAiError({
+                errorCode: 'session.vendor-mismatch',
+                stage: 'session-generation',
+                retryHint: 'use-session-vendor',
+                vendor: String(vendor),
+                mutationAllowed: false,
+                message: `session ${sessionId} belongs to ${current.vendor}, not ${vendor}`,
+                evidence: { sessionId, sessionVendor: current.vendor, requestedVendor: vendor },
+            });
+        }
+        if (meta.targetId && current.targetId && meta.targetId !== current.targetId) {
+            throw new WebAiError({
+                errorCode: 'cdp.target-mismatch',
+                stage: 'session-generation',
+                retryHint: 'use-correct-session',
+                vendor: current.vendor || undefined,
+                mutationAllowed: false,
+                message: `session ${sessionId} is bound to target ${current.targetId}, not ${meta.targetId}`,
+                evidence: { sessionId, expectedTargetId: current.targetId, actualTargetId: meta.targetId },
+            });
+        }
+
+        const currentConversationId = sessionConversationId(current);
+        const liveConversationId = extractDurableConversationId(meta.conversationUrl);
+        if (current.vendor === 'chatgpt' && currentConversationId && liveConversationId !== currentConversationId) {
+            throw conversationMismatchError(current, liveConversationId, meta.conversationUrl);
+        }
+
+        const now = new Date().toISOString();
+        const nextConversationId = currentConversationId || liveConversationId || null;
+        return buildSessionPatch(current, {
+            generation: sessionGeneration(current) + 1,
+            generationStartedAt: now,
+            targetId: current.targetId || meta.targetId || null,
+            conversationId: nextConversationId,
+            conversationUrl: nextConversationId
+                ? canonicalChatGptConversationUrl(meta.conversationUrl || current.conversationUrl)
+                : current.conversationUrl,
+            deadlineAt: meta.deadlineAt || current.deadlineAt || null,
+            promptHash: `sha256:${hashPrompt(envelope || {})}`,
+            envelopeSummary: meta.envelopeSummary || {},
+            ...(meta.modelSelection !== undefined ? { modelSelection: meta.modelSelection } : {}),
+            status: 'sent',
+            answer: null,
+            completedAt: null,
+            submittedUserMessageId: null,
+            submittedUserTurnId: null,
+            responseMessageId: null,
+            responseTurnId: null,
+            lastError: null,
+            warnings: [],
+            lastDomHash: null,
+            lastAxHash: null,
+            lastStreamingState: 'unknown',
+            lastResponseCharCount: 0,
+        });
+    });
+}
+
+/**
+ * Generation-fenced read-modify-write. The comparison and mutation happen
+ * under the same store lock.
+ *
+ * @param {string} sessionId
+ * @param {number} generation
+ * @param {(current: WebAiSession) => (Partial<WebAiSession> & Record<string, unknown>)|null} mutate
+ * @param {() => boolean} [stillActive]
+ * @returns {Promise<WebAiSession|null|typeof DEADLINE_PASSED|typeof GENERATION_CHANGED>}
+ */
+export async function mutateSessionForGeneration(sessionId, generation, mutate, stillActive) {
+    const expectedGeneration = Number(generation);
+    let mismatch = false;
+    const result = await mutateSessionAsync(sessionId, (current) => {
+        if (sessionGeneration(current) !== expectedGeneration) {
+            mismatch = true;
+            return null;
+        }
+        const patch = mutate(current);
+        if (!patch) return null;
+        const nextPatch = { ...patch };
+        delete nextPatch.generation;
+        return buildSessionPatch(current, nextPatch);
+    }, stillActive);
+    if (mismatch) return GENERATION_CHANGED;
+    return result;
+}
+
+/**
+ * @param {string} sessionId
+ * @param {number} generation
+ * @param {Partial<WebAiSession> & Record<string, unknown>} [patch]
+ * @param {() => boolean} [stillActive]
+ */
+export function updateSessionForGeneration(sessionId, generation, patch = {}, stillActive) {
+    return mutateSessionForGeneration(sessionId, generation, () => patch, stillActive);
+}
+
+/**
+ * @param {string} sessionId
+ * @param {number} generation
+ * @param {Partial<WebAiSession> & { warnings?: unknown[], warning?: unknown, lastError?: unknown }} [patch]
+ * @param {() => boolean} [stillActive]
+ */
+export function markSessionTimeoutForGeneration(sessionId, generation, patch = {}, stillActive) {
+    return mutateSessionForGeneration(
+        sessionId,
+        generation,
+        (current) => buildTimeoutPatch(current, patch),
+        stillActive,
+    );
+}
+
+/**
+ * Bind the first durable ChatGPT conversation URL, or verify that a later
+ * observation refers to the same immutable conversation.
+ *
+ * @param {string} sessionId
+ * @param {number} generation
+ * @param {string|null|undefined} conversationUrl
+ * @param {() => boolean} [stillActive]
+ */
+export function bindSessionConversation(sessionId, generation, conversationUrl, stillActive) {
+    return mutateSessionForGeneration(sessionId, generation, (current) => {
+        if (current.vendor !== 'chatgpt') return { conversationUrl };
+        const actualConversationId = extractDurableConversationId(conversationUrl);
+        const expectedConversationId = sessionConversationId(current);
+        if (!actualConversationId || (expectedConversationId && actualConversationId !== expectedConversationId)) {
+            throw conversationMismatchError(current, actualConversationId, conversationUrl);
+        }
+        return {
+            conversationId: expectedConversationId || actualConversationId,
+            conversationUrl: canonicalChatGptConversationUrl(conversationUrl),
+        };
+    }, stillActive);
+}
+
+/**
+ * @param {string} sessionId
+ * @param {number} generation
+ * @returns {Promise<boolean>}
+ */
+export async function isSessionGenerationCurrent(sessionId, generation) {
+    const current = await readSessionAsync(sessionId);
+    return Boolean(current && sessionGeneration(current) === Number(generation));
+}
+
+/**
+ * @param {WebAiSession} current
+ * @param {string|null} actualConversationId
+ * @param {unknown} actualUrl
+ */
+function conversationMismatchError(current, actualConversationId, actualUrl) {
+    const expectedConversationId = sessionConversationId(current);
+    return new WebAiError({
+        errorCode: 'session.conversation-mismatch',
+        stage: 'conversation-identity',
+        retryHint: 'use-correct-session',
+        vendor: current.vendor || undefined,
+        mutationAllowed: false,
+        message: `session ${current.sessionId} is bound to conversation ${expectedConversationId || 'unknown'}, not ${actualConversationId || 'unverified'}`,
+        evidence: {
+            sessionId: current.sessionId,
+            targetId: current.targetId || null,
+            expectedConversationId,
+            actualConversationId: actualConversationId || null,
+            actualUrl: typeof actualUrl === 'string' ? actualUrl : null,
+        },
+    });
 }
 
 /**
@@ -654,6 +916,30 @@ export function storedDeadlineRemainderMs(session = null, nowMs = Date.now()) {
 export function expiredSessionTimeoutResult(sessionId, fallbackVendor = 'chatgpt', nowMs = undefined) {
     const session = getSession(sessionId);
     if (!session) return null;
+    // A completed generation is durable evidence, not a request that can later
+    // "expire" back into timeout. Return the stored terminal result before
+    // consulting deadlineAt so poll/status callers never lose a finished answer.
+    if (COMPLETED_SESSION_STATUSES.has(session.status) || Boolean(session.completedAt)) {
+        return {
+            ok: true,
+            vendor: session.vendor || fallbackVendor,
+            status: 'complete',
+            sessionId: session.sessionId,
+            generation: sessionGeneration(session),
+            targetId: session.targetId || undefined,
+            conversationId: sessionConversationId(session) || undefined,
+            conversationUrl: session.conversationUrl || session.originalUrl || undefined,
+            url: session.conversationUrl || session.originalUrl || undefined,
+            answerText: typeof session.answer === 'string' ? session.answer : '',
+            usedFallbacks: [],
+            warnings: Array.isArray(session.warnings) ? session.warnings : [],
+            recoverable: false,
+            completedAt: session.completedAt || undefined,
+            ...(Array.isArray(session.artifacts) && session.artifacts.length
+                ? { artifacts: session.artifacts }
+                : {}),
+        };
+    }
     // Sampled AFTER the read, not as a default parameter. `getSession` takes
     // the store lock, which retries and can block for seconds; a clock read
     // before it would compare a fresh session against a stale time and let an

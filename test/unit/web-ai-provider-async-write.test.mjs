@@ -56,7 +56,7 @@ describe.each([
     });
 });
 
-function createMultiTurnHarness({ stallAssistantRead = false } = {}) {
+function createMultiTurnHarness({ stallAssistantRead = false, conversationSlug = 'multi-turn-async' } = {}) {
     let prompt = '';
     let submitted = false;
     let releaseAssistantRead = () => undefined;
@@ -76,7 +76,7 @@ function createMultiTurnHarness({ stallAssistantRead = false } = {}) {
     };
 
     const page = {
-        url: () => 'https://chatgpt.com/c/multi-turn-async',
+        url: () => `https://chatgpt.com/c/${conversationSlug}`,
         waitForTimeout: async () => undefined,
         keyboard: { press: async () => undefined },
         evaluate: async (_fn, arg) => {
@@ -126,7 +126,7 @@ function createMultiTurnHarness({ stallAssistantRead = false } = {}) {
 describe('multi-turn outer deadline bookkeeping', () => {
     it('persists partial state when a turn times out while the outer run is alive', async () => {
         const session = createChatSession('partial-outer-alive');
-        const { page, deps } = createMultiTurnHarness();
+        const { page, deps } = createMultiTurnHarness({ conversationSlug: 'partial-outer-alive' });
 
         const result = await sendMultiTurn(page, deps, {
             followUps: ['first', 'second'],
@@ -146,7 +146,10 @@ describe('multi-turn outer deadline bookkeeping', () => {
     it('refuses detached bookkeeping after the outer race is lost', async () => {
         const session = createChatSession('partial-outer-lost');
         const before = getSession(session.sessionId);
-        const { page, deps, releaseAssistantRead, assistantReadFinished } = createMultiTurnHarness({ stallAssistantRead: true });
+        const { page, deps, releaseAssistantRead, assistantReadFinished } = createMultiTurnHarness({
+            stallAssistantRead: true,
+            conversationSlug: 'partial-outer-lost',
+        });
 
         const result = await sendMultiTurn(page, deps, {
             followUps: ['stalled'],

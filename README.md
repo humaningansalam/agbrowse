@@ -692,22 +692,24 @@ were saved.
 The record stores `targetId`, `tabId`, and `tabState` (`createdAt`,
 `lastActiveAt`, `recoveryCount`, `closeCount`). `stop --session <id>` resolves
 that bound tab and sends Escape as an interrupt without taking over the running
-poll's target lease. If the bound tab is closed mid-operation, the runtime
-auto-recovers once by creating a new tab and navigating to the saved
-`conversationUrl` where the command permits navigation.
+poll's target lease. If the bound tab is positively proven closed, the runtime
+may recover it once by creating a new tab at that session's exact saved
+`conversationUrl`. A live ChatGPT target showing another conversation fails
+closed: it is never navigated or rebound to hide the mismatch.
 
 Temporary Chat sessions are never archived, including when archive mode is
 forced, because they are not durable ChatGPT conversations.
 
-Add `--deadline <iso>` to override the default deadline (now + `--timeout`)
-and `--navigate` to allow `sessions resume` to switch tabs when the saved
-`conversationUrl` differs from the current tab.
+Add `--deadline <iso>` to override the default deadline (now + `--timeout`).
+`--navigate` authorizes saved-URL recovery only when the stored target is
+proven gone; it does not authorize changing a live ChatGPT conversation.
 
 #### Durable session recovery
 
 Session recovery is target-bound. `poll --session`, `watch --session`,
 `sessions resume`, and `sessions reattach` resolve the session's stored target
-first, then recover/navigate only when the command permits it. Use
+first. They reuse it only when its ChatGPT conversation identity matches, and
+replace it only after liveness is positively `gone`. Use
 `agbrowse web-ai sessions doctor <id> --json` when a shell was interrupted or
 a provider tab outlived a local timeout.
 
@@ -735,9 +737,10 @@ failures. Every error becomes:
 ```
 
 Poll-stage target drift is returned as a command result, not just an error
-envelope. The result includes `ok: false`, `status: "target-mismatch"`,
-`expectedTargetId`, `actualTargetId`, `port`, a `targetMismatch` object, and a
-`recovery` command such as:
+envelope. A missing target may include a saved-URL recovery command. A live
+ChatGPT conversation mismatch instead returns `session.conversation-mismatch`
+with expected/actual conversation IDs and no automatic navigation command.
+For a positively gone target, recovery is explicit:
 
 ```bash
 agbrowse web-ai poll --vendor chatgpt --session "$SID" --navigate --json

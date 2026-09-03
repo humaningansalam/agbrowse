@@ -8,26 +8,33 @@ import { renderQuestionEnvelope, renderQuestionEnvelopeWithContext, normalizeEnv
 import { defineCapability, probeFirstVisibleSelector, probeHostMatches, runCapabilities, worstCapabilityState } from './capability.mjs';
 import { INPUT_SELECTORS as CHATGPT_COMPOSER_SELECTORS } from './chatgpt-composer.mjs';
 import {
+    beginSessionGeneration,
+    bindSessionConversation,
     bindSessionToTab,
     createSession,
     DEADLINE_PASSED,
+    GENERATION_CHANGED,
     findActiveSession,
     getBaseline,
     getLatestBaseline,
     getSession,
+    isSessionGenerationCurrent,
     markSessionTimeout,
-    markSessionTimeoutAsync,
+    markSessionTimeoutForGeneration,
+    mutateSessionForGeneration,
     resolveDeadlineAt,
     resolveFileArtifactPolicy,
     resolveTimeoutBudgetSec,
     saveBaseline,
+    sessionGeneration,
     sessionToBaseline,
     storedDeadlineRemainderMs,
     summarizeEnvelope,
     updateSession,
-    updateSessionAsync,
+    updateSessionForGeneration,
 } from './session.mjs';
-import { mutateSessionAsync, readSessionAsync, sessionStoreReadWasCorrupt } from './session-store.mjs';
+import { readSessionAsync, sessionStoreReadWasCorrupt } from './session-store.mjs';
+import { extractDurableConversationId } from './conversation-url.mjs';
 import { WebAiError } from './errors.mjs';
 import { POLL_EXPIRED, monotonicNowMs, withPollDeadline } from './poll-deadline.mjs';
 import { detectInterstitial, INTERSTITIAL_SHELL_SELECTORS_BY_PROVIDER } from './interstitial.mjs';
@@ -69,6 +76,7 @@ import {
     readAssistantSnapshotSources,
     readAssistantTurnOrderingInPage,
     readChatGptStreamingState,
+    readLatestUserTurnIdentity,
     readTopLevelAssistantSnapshots,
     readTopLevelAssistantTextsFromLocators,
     resolveTopLevelAssistantTurns,
@@ -370,15 +378,41 @@ export async function sendWebAi(deps, input = {}) {
         textHash: String((await page.innerText('body').catch(() => '')).length),
     });
     const targetId = await deps.getTargetId?.().catch(() => null) || null;
-    const session = createSession(envelope, {
-        targetId,
-        originalUrl: input.url || page.url(),
-        conversationUrl: page.url(),
-        deadlineAt: resolveDeadlineAt(input, 'chatgpt'),
-        envelopeSummary: { ...summarizeEnvelope(input, contextPack), assistantCount },
-    });
+    const deadlineAt = resolveDeadlineAt(input, 'chatgpt');
+    const envelopeSummary = { ...summarizeEnvelope(input, contextPack), assistantCount };
+    const session = input.session
+        ? await beginSessionGeneration(input.session, envelope, {
+            targetId,
+            conversationUrl: page.url(),
+            deadlineAt,
+            envelopeSummary,
+            modelSelection: selectedModel?.modelSelection,
+        })
+        : createSession(envelope, {
+            targetId,
+            originalUrl: input.url || page.url(),
+            conversationUrl: page.url(),
+            deadlineAt,
+            envelopeSummary,
+        });
+    if (!session || session === DEADLINE_PASSED) {
+        throw new WebAiError({
+            errorCode: 'session.generation-start-failed',
+            stage: 'session-generation',
+            retryHint: 'retry',
+            vendor: 'chatgpt',
+            mutationAllowed: false,
+            message: `could not start a request for session ${input.session || 'new'}`,
+        });
+    }
+    const generation = sessionGeneration(session);
     if (selectedModel?.modelSelection) {
-        updateSession(session.sessionId, { modelSelection: selectedModel.modelSelection });
+        const modelWrite = await updateSessionForGeneration(session.sessionId, generation, {
+            modelSelection: selectedModel.modelSelection,
+        });
+        if (modelWrite === GENERATION_CHANGED) {
+            throw generationSupersededError(session.sessionId, generation);
+        }
     }
     if (targetId) await recordActiveLease({
         owner: 'web-ai',
@@ -389,7 +423,7 @@ export async function sendWebAi(deps, input = {}) {
         url: page.url(),
         port: deps.getPort?.() || 9222,
     });
-    if (targetId) bindSessionToTab(session.sessionId, targetId);
+    if (targetId && !input.session) bindSessionToTab(session.sessionId, targetId);
 
     const editorOptions = {
         insertText: async (/** @type {any} */ text) => {
@@ -485,13 +519,55 @@ export async function sendWebAi(deps, input = {}) {
                 message: 'send button never became enabled while attachments were pending',
             });
         }
-        await adapter.verifyPromptCommitted(rendered.composerText, commitBaseline, {
+        const committed = await adapter.verifyPromptCommitted(rendered.composerText, commitBaseline, {
             timeoutMs: submitTimeoutMs,
         });
+        const submittedUser = committed?.userMessageId || committed?.userTurnId
+            ? {
+                messageId: committed.userMessageId || null,
+                turnId: committed.userTurnId || null,
+            }
+            : await readSubmittedUserTurnAnchor(page);
         await verifySentAttachments(page, uploadFiles, { usedFallbacks, attachmentWarnings });
-        const finalUrl = page.url();
-        if (session && finalUrl !== session.conversationUrl) {
-            updateSession(session.sessionId, { conversationUrl: finalUrl });
+        const finalUrl = await waitForCommittedConversationUrl(page);
+        const boundConversation = await bindSessionConversation(
+            session.sessionId,
+            generation,
+            finalUrl,
+        );
+        if (boundConversation === GENERATION_CHANGED) {
+            throw generationSupersededError(session.sessionId, generation);
+        }
+        if (!boundConversation || boundConversation === DEADLINE_PASSED) {
+            throw new WebAiError({
+                errorCode: 'session.conversation-unresolved',
+                stage: 'conversation-identity',
+                retryHint: 'poll-or-resume',
+                vendor: 'chatgpt',
+                mutationAllowed: true,
+                message: `ChatGPT committed the prompt but did not expose a durable conversation URL for session ${session.sessionId}`,
+                evidence: { sessionId: session.sessionId, generation, targetId, finalUrl },
+            });
+        }
+        const anchored = await updateSessionForGeneration(session.sessionId, generation, {
+            submittedUserMessageId: submittedUser.messageId,
+            submittedUserTurnId: submittedUser.turnId,
+            responseMessageId: null,
+            responseTurnId: null,
+        });
+        if (anchored === GENERATION_CHANGED) {
+            throw generationSupersededError(session.sessionId, generation);
+        }
+        if (!anchored || anchored === DEADLINE_PASSED) {
+            throw new WebAiError({
+                errorCode: 'session.turn-anchor-unresolved',
+                stage: 'response-correlation',
+                retryHint: 'poll-or-resume',
+                vendor: 'chatgpt',
+                mutationAllowed: true,
+                message: `ChatGPT committed the prompt but its user turn identity could not be stored for session ${session.sessionId}`,
+                evidence: { sessionId: session.sessionId, generation, targetId, submittedUser },
+            });
         }
         const traceSummary = persistResolverTrace(session.sessionId, traceCtx);
         tracePersisted = true;
@@ -501,6 +577,10 @@ export async function sendWebAi(deps, input = {}) {
             status: 'sent',
             url: finalUrl,
             sessionId: session.sessionId,
+            generation,
+            conversationId: boundConversation.conversationId || null,
+            submittedUserMessageId: submittedUser.messageId,
+            submittedUserTurnId: submittedUser.turnId,
             baseline,
             usedFallbacks: [...usedFallbacks, ...(selectedModel?.usedFallbacks || []), ...(selectedTools?.usedFallbacks || [])],
             ...(traceSummary ? { traceSummary } : {}),
@@ -848,6 +928,14 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
             targetId: await deps.getTargetId?.().catch(() => null) || null,
             conversationUrl: url,
         });
+    const expectedGeneration = session
+        ? (Number.isInteger(Number(input.generation)) && Number(input.generation) > 0
+            ? Number(input.generation)
+            : sessionGeneration(session))
+        : null;
+    if (session && sessionGeneration(session) !== expectedGeneration) {
+        return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+    }
     // B23: a corrupt store collapses to an empty one, so a failed read looks
     // exactly like "no session". The flag is read HERE, right after the lookup,
     // so the observation is about this read and not some later one.
@@ -980,6 +1068,19 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
     let stableSnapshot = null;
     let stableSince = 0;
     let lastHeartbeat = 0;
+    const submittedUserMessageId = typeof session?.submittedUserMessageId === 'string'
+        ? session.submittedUserMessageId
+        : null;
+    const submittedUserTurnId = typeof session?.submittedUserTurnId === 'string'
+        ? session.submittedUserTurnId
+        : null;
+    const hasSubmittedUserAnchor = Boolean(submittedUserMessageId || submittedUserTurnId);
+    let responseMessageId = typeof session?.responseMessageId === 'string'
+        ? session.responseMessageId
+        : null;
+    let responseTurnId = typeof session?.responseTurnId === 'string'
+        ? session.responseTurnId
+        : null;
     // 33 short-circuit: a MutationObserver wakes the loop as soon as the response
     // settles (bounded so it self-disconnects). The poller stays AUTHORITATIVE —
     // it still reads + verifies every tick; this only reduces wait latency, so the
@@ -990,6 +1091,9 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         : null;
     while (Date.now() < deadline) {
         try {
+        if (session && !await isSessionGenerationCurrent(session.sessionId, expectedGeneration)) {
+            return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+        }
         let identityOk = true;
         if (session?.targetId) {
             const identity = await readTargetIdentity(deps, session);
@@ -1022,12 +1126,28 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                 }, observations);
             }
         }
-        const split = await readAssistantSnapshotsSplit(page);
+        const split = await readAssistantSnapshotsSplit(page, {
+            submittedUserMessageId,
+            submittedUserTurnId,
+            responseMessageId,
+            responseTurnId,
+        });
         // Only a FAILED acquisition falls back. A successful empty read means the
         // page genuinely has nothing yet, and must keep polling rather than have a
         // legacy reader invent candidates.
         let wrapped = split.wrapped;
         if (!split.ok) {
+            // A generation with an exact user-turn cursor must never fall back
+            // to an uncorrelated whole-conversation read. That would undo the
+            // virtualization fix and could return another generation's answer.
+            if (hasSubmittedUserAnchor) {
+                observations.add('assistant-correlation-unverified');
+                stableText = '';
+                stableSnapshot = null;
+                stableSince = 0;
+                if (!await paceTick()) break;
+                continue;
+            }
             const fallbackRead = await readAssistantSnapshots(page);
             // Both readers failed: there is no candidate set to reason about, so
             // reset stability and let the shared pacing below run. Skipping the
@@ -1048,15 +1168,39 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
             }));
         }
         const wrapperless = split.wrapperless;
-        // Wrapped turns are positional: slice against the pre-send count.
-        // Wrapperless blocks are already correlated by DOM-following the latest
-        // user node, so slicing them against a stale count would drop the answer.
+        if (hasSubmittedUserAnchor && !split.userAnchorFound && !split.responseAnchorFound) {
+            observations.add('submitted-user-anchor-unavailable');
+            stableText = '';
+            stableSnapshot = null;
+            stableSince = 0;
+            if (!await paceTick()) break;
+            continue;
+        }
+        // New sessions use the exact submitted-user turn as their causal cursor.
+        // assistantCount remains only as a legacy fallback for pre-v3 rows.
         // Merge by DOM order so `.at(-1)` means "last in the document".
-        const newSnapshots = [...wrapped.slice(baseline.assistantCount), ...wrapperless]
+        const correlatedWrapped = hasSubmittedUserAnchor
+            ? wrapped
+            : wrapped.slice(baseline.assistantCount);
+        const newSnapshots = [...correlatedWrapped, ...wrapperless]
             .sort((a, b) => (a.domOrder ?? 0) - (b.domOrder ?? 0))
             .filter(sample => isFinalAnswer(sample.text));
         const latestSnapshot = newSnapshots.at(-1) || null;
         const latest = latestSnapshot?.text || '';
+        if (session && hasSubmittedUserAnchor && latestSnapshot
+            && (latestSnapshot.messageId || latestSnapshot.turnId)
+            && (latestSnapshot.messageId !== responseMessageId || latestSnapshot.turnId !== responseTurnId)) {
+            const responseAnchor = await updateSessionForGeneration(session.sessionId, expectedGeneration, {
+                responseMessageId: latestSnapshot.messageId || null,
+                responseTurnId: latestSnapshot.turnId || null,
+            }, isActiveRun);
+            if (responseAnchor === DEADLINE_PASSED) throw POLL_EXPIRED;
+            if (responseAnchor === GENERATION_CHANGED) {
+                return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+            }
+            responseMessageId = latestSnapshot.messageId || null;
+            responseTurnId = latestSnapshot.turnId || null;
+        }
         const activity = await readActivityState(page);
         recordActivityObservation(activity, observations);
         // `streaming` now means STRONG evidence only. Weak activity — a mounted
@@ -1080,7 +1224,13 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         // evidence, so it requires true quiet: weak activity is still activity.
         if (activity.strength === 'none' && latestSnapshot && session && input.outputImage !== undefined
             && isImageOnlyGeneratedImageChromeText(latest)) {
-            const imageResult = await commitAsyncIfActive(() => collectGeneratedImageAnswer(deps, input, session, baseline, isActiveRun));
+            const imageResult = await commitAsyncIfActive(() => collectGeneratedImageAnswer(
+                deps,
+                input,
+                session,
+                baseline,
+                isActiveRun,
+            ));
             if (imageResult) {
                 const imageWarnings = mergeObservationList(imageResult.warnings, observations);
                 const imageFileCapture = await captureFileArtifacts({
@@ -1091,6 +1241,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                 if (!input.skipFinalize) {
                     await commitAsyncIfActive(() => finalizeProviderTab(deps, {
                         vendor, session: /** @type {any} */ (session), page,
+                        generation: expectedGeneration,
                         answerText: imageResult.answerText,
                         warnings: imageWarnings,
                         archiveFlag: input.archiveFlag,
@@ -1099,6 +1250,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                 }
                 return withAnswerArtifact({
                     ok: true, vendor, status: 'complete', url: page.url(), sessionId: session.sessionId,
+                    generation: expectedGeneration,
                     ...(imageFileCapture?.artifacts ? { artifacts: imageFileCapture.artifacts } : {}),
                     answerText: imageResult.answerText, baseline, usedFallbacks: ['generated-image'],
                     warnings: imageWarnings, responseStableMs: 0,
@@ -1106,7 +1258,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
             }
         }
         const completion = !streaming && latestSnapshot
-            ? await isResponseFinished(page, latestSnapshot, baseline.assistantCount)
+            ? await isResponseFinished(page, latestSnapshot, hasSubmittedUserAnchor ? 0 : baseline.assistantCount)
             : { finished: false, messageId: null, turnId: null, turnIndex: -1 };
         const finished = completion.finished === true;
         // G5: Turn ordering — ensure latest assistant turn follows latest user turn
@@ -1140,7 +1292,11 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                         const copied = await captureCopiedResponseText(page, CHATGPT_COPY_SELECTORS, {
                             copyTarget: /** @type {any} */ (copyResolution?.target || null),
                         });
-                        traceSummary = await persistResolverTraceForSessionAsync(session, copyTraceCtx, isActiveRun);
+                        traceSummary = await persistResolverTraceForSessionAsync(
+                            session,
+                            copyTraceCtx,
+                            isActiveRun,
+                        );
                         const copiedText = preferCopiedText(latest, copied);
                         if (copiedText) {
                             answerText = cleanAssistantText(copiedText);
@@ -1164,7 +1320,8 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                             const imgResult = await commitAsyncIfActive(() => collectImages(cdp, {
                                 baselineAssistantCount: baseline?.assistantCount || 0,
                                 outputPath: input.outputImage || null,
-                                sessionId: input.outputImage ? null : session.sessionId,
+                                sessionId: session.sessionId,
+                                generation: expectedGeneration,
                                 waitTimeoutMs: 60_000,
                                 stillActive: isActiveRun,
                             }));
@@ -1203,7 +1360,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                         if (!warnings.includes(observation)) warnings.push(observation);
                     }
                     if (session && !input.skipFinalize) {
-                        await commitAsyncIfActive(() => finalizeProviderTab(deps, { vendor, session: /** @type {any} */ (session), page, answerText, warnings, archiveFlag: input.archiveFlag, stillActive: isActiveRun }));
+                        await commitAsyncIfActive(() => finalizeProviderTab(deps, { vendor, session: /** @type {any} */ (session), page, generation: expectedGeneration, answerText, warnings, archiveFlag: input.archiveFlag, stillActive: isActiveRun }));
                     }
                     return withAnswerArtifact({
                         ok: true,
@@ -1211,7 +1368,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                         ...(fileCapture?.artifacts ? { artifacts: fileCapture.artifacts } : {}),
                         status: 'complete',
                         url: page.url(),
-                        ...(session ? { sessionId: session.sessionId } : {}),
+                        ...(session ? { sessionId: session.sessionId, generation: expectedGeneration } : {}),
                         answerText,
                         baseline,
                         usedFallbacks,
@@ -1243,12 +1400,20 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                     // contended acquire froze the deadline timer, and the gate
                     // taken BEFORE the wait said nothing about the moment the
                     // write landed. The predicate is re-checked under the lock.
-                    const crashed = await updateSessionAsync(session.sessionId, { status: 'crashed' }, isActiveRun);
+                    const crashed = await updateSessionForGeneration(
+                        session.sessionId,
+                        expectedGeneration,
+                        { status: 'crashed' },
+                        isActiveRun,
+                    );
                     if (crashed === DEADLINE_PASSED) throw POLL_EXPIRED;
+                    if (crashed === GENERATION_CHANGED) {
+                        return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+                    }
                 }
                 return mergeObservationWarnings({
                     ok: false, vendor, status: 'tab-crashed',
-                    url: baseline.url || '', ...(session ? { sessionId: session.sessionId } : {}),
+                    url: baseline.url || '', ...(session ? { sessionId: session.sessionId, generation: expectedGeneration } : {}),
                     answerText: '', baseline, usedFallbacks: [],
                     warnings: ['tab-crashed-during-poll'],
                     error: String((/** @type {any} */ (pollErr))?.message || pollErr),
@@ -1263,6 +1428,9 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
     // assistant turn once — recovers a final answer the loop missed (e.g. a late
     // DOM settle). Session polls only (recovery persists to the session).
     if (session) {
+        if (!await isSessionGenerationCurrent(session.sessionId, expectedGeneration)) {
+            return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+        }
         // Capture the STRUCTURED verdict of the read recovery performs. Boolean
         // `isStreaming` throws that away, and the ledger needs to know whether the
         // page could be read at all. `recoverAssistantResponse` invokes this
@@ -1271,6 +1439,10 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         let recoveryActivity = null;
         const recovered = await recoverAssistantResponse(page, {
             baselineAssistantCount: baseline.assistantCount,
+            submittedUserMessageId,
+            submittedUserTurnId,
+            responseMessageId,
+            responseTurnId,
             isFinalAnswer,
             readStreaming: async () => {
                 recoveryActivity = await readActivityState(page);
@@ -1278,7 +1450,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                 return isActiveState(recoveryActivity);
             },
             readFinished: async sample => {
-                const completion = await isResponseFinished(page, sample, baseline.assistantCount);
+                const completion = await isResponseFinished(page, sample, hasSubmittedUserAnchor ? 0 : baseline.assistantCount);
                 return completion.finished === true;
             },
         });
@@ -1292,6 +1464,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                     streamingState: 'streaming',
                     observations,
                     stillActive: isActiveRun,
+                    generation: expectedGeneration,
                 });
             }
             // This path does not collect images. When the caller asked for a
@@ -1336,6 +1509,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                     streamingState: 'unknown',
                     observations,
                     stillActive: isActiveRun,
+                    generation: expectedGeneration,
                 });
             }
             const answerText = recovered.text;
@@ -1346,7 +1520,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
             });
             if (recoveryFileCapture?.failed) return recoveryFileCapture;
             if (!input.skipFinalize) {
-                await commitAsyncIfActive(() => finalizeProviderTab(deps, { vendor, session: /** @type {any} */ (session), page, answerText, warnings, archiveFlag: input.archiveFlag, stillActive: isActiveRun }));
+                await commitAsyncIfActive(() => finalizeProviderTab(deps, { vendor, session: /** @type {any} */ (session), page, generation: expectedGeneration, answerText, warnings, archiveFlag: input.archiveFlag, stillActive: isActiveRun }));
             }
             return withAnswerArtifact({
                 ok: true,
@@ -1355,6 +1529,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                 status: 'complete',
                 url: page.url(),
                 sessionId: session.sessionId,
+                generation: expectedGeneration,
                 answerText,
                 baseline,
                 usedFallbacks: ['recovery'],
@@ -1385,6 +1560,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                     streamingState: 'streaming',
                     observations,
                     stillActive: isActiveRun,
+                    generation: expectedGeneration,
                 });
             }
             stableText = '';
@@ -1410,6 +1586,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                     streamingState: 'unknown',
                     observations,
                     stillActive: isActiveRun,
+                    generation: expectedGeneration,
                 });
             }
             stableText = '';
@@ -1422,7 +1599,11 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         const copied = await captureCopiedResponseText(page, CHATGPT_COPY_SELECTORS, {
             copyTarget: /** @type {any} */ (copyResolution?.target || null),
         });
-        const traceSummary = await persistResolverTraceForSessionAsync(session, copyTraceCtx, isActiveRun);
+        const traceSummary = await persistResolverTraceForSessionAsync(
+            session,
+            copyTraceCtx,
+            isActiveRun,
+        );
         const copiedText = preferCopiedText(stableText, copied);
         if (copiedText) {
             const answerText = cleanAssistantText(copiedText);
@@ -1433,7 +1614,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
             });
             if (copyFileCapture?.failed) return copyFileCapture;
             if (session && !input.skipFinalize) {
-                await commitAsyncIfActive(() => finalizeProviderTab(deps, { vendor, session: /** @type {any} */ (session), page, answerText, warnings, archiveFlag: input.archiveFlag, stillActive: isActiveRun }));
+                await commitAsyncIfActive(() => finalizeProviderTab(deps, { vendor, session: /** @type {any} */ (session), page, generation: expectedGeneration, answerText, warnings, archiveFlag: input.archiveFlag, stillActive: isActiveRun }));
             }
             return withAnswerArtifact({
                 ok: true,
@@ -1441,7 +1622,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                 ...(copyFileCapture?.artifacts ? { artifacts: copyFileCapture.artifacts } : {}),
                 status: 'complete',
                 url: page.url(),
-                ...(session ? { sessionId: session.sessionId } : {}),
+                ...(session ? { sessionId: session.sessionId, generation: expectedGeneration } : {}),
                 answerText,
                 baseline,
                 usedFallbacks: ['copy-markdown'],
@@ -1453,17 +1634,20 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         // Awaited + post-lock gated: the sync form decided before the blocking
         // lock, so a loser could still record a timeout after its caller
         // returned. DEADLINE_PASSED keeps the throw semantics of the old gate.
-        const timedOutRow = session ? await markSessionTimeoutAsync(session.sessionId, {
+        const timedOutRow = session ? await markSessionTimeoutForGeneration(session.sessionId, expectedGeneration, {
             lastError: { errorCode: 'provider.poll-timeout', message: 'timed out waiting for answer' },
         }, isActiveRun) : null;
         if (timedOutRow === DEADLINE_PASSED) throw POLL_EXPIRED;
+        if (timedOutRow === GENERATION_CHANGED) {
+            return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+        }
         const timedOutSession = timedOutRow === DEADLINE_PASSED ? null : timedOutRow;
         return mergeObservationWarnings({
             ok: false,
             vendor,
             status: 'timeout',
             url: page.url(),
-            ...(session ? { sessionId: session.sessionId } : {}),
+            ...(session ? { sessionId: session.sessionId, generation: expectedGeneration } : {}),
             ...(timedOutSession?.deadlineAt ? { deadlineAt: timedOutSession.deadlineAt } : {}),
             ...(timedOutSession?.conversationUrl ? { conversationUrl: timedOutSession.conversationUrl } : {}),
             baseline,
@@ -1476,17 +1660,20 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         }, observations);
     }
     // Same contract as the copy-markdown branch above: gate under the lock.
-    const timedOutRow = session ? await markSessionTimeoutAsync(session.sessionId, {
+    const timedOutRow = session ? await markSessionTimeoutForGeneration(session.sessionId, expectedGeneration, {
         lastError: { errorCode: 'provider.poll-timeout', message: 'timed out waiting for answer' },
     }, isActiveRun) : null;
     if (timedOutRow === DEADLINE_PASSED) throw POLL_EXPIRED;
+    if (timedOutRow === GENERATION_CHANGED) {
+        return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+    }
     const timedOutSession = timedOutRow === DEADLINE_PASSED ? null : timedOutRow;
     return mergeObservationWarnings({
         ok: false,
         vendor,
         status: 'timeout',
         url: page.url(),
-        ...(session ? { sessionId: session.sessionId } : {}),
+        ...(session ? { sessionId: session.sessionId, generation: expectedGeneration } : {}),
         ...(timedOutSession?.deadlineAt ? { deadlineAt: timedOutSession.deadlineAt } : {}),
         ...(timedOutSession?.conversationUrl ? { conversationUrl: timedOutSession.conversationUrl } : {}),
         baseline,
@@ -1623,6 +1810,7 @@ export async function queryWebAi(deps, input = {}) {
         vendor: sent.vendor,
         timeout: input.timeout,
         session: sent.sessionId,
+        generation: sent.generation,
         allowCopyMarkdownFallback: input.allowCopyMarkdownFallback === true,
         outputImage: input.outputImage,
         // Without this the requirement given to `send`/`query` would be dropped
@@ -1636,6 +1824,7 @@ export async function queryWebAi(deps, input = {}) {
     return {
         ...resultAny,
         sessionId: result.sessionId || sent.sessionId,
+        generation: resultAny.generation || sentAny.generation,
         ...(resultAny.traceSummary || sentAny.traceSummary ? { traceSummary: resultAny.traceSummary || sentAny.traceSummary } : {}),
         usedFallbacks: [...(sentAny.usedFallbacks || []), ...(resultAny.usedFallbacks || [])],
         warnings: [...(sentAny.warnings || []), ...(resultAny.warnings || [])],
@@ -1904,15 +2093,6 @@ async function persistResolverTraceAsync(sessionId, traceCtx, stillActive) {
 /**
  * @param {any} session
  * @param {any} traceCtx
- */
-function persistResolverTraceForSession(session, traceCtx) {
-    if (!session?.sessionId || !traceCtx) return null;
-    return persistResolverTrace(session.sessionId, traceCtx);
-}
-
-/**
- * @param {any} session
- * @param {any} traceCtx
  * @param {() => boolean} [stillActive]
  */
 async function persistResolverTraceForSessionAsync(session, traceCtx, stillActive) {
@@ -2077,21 +2257,32 @@ async function readAssistantSnapshots(page) {
  * with a single coordinate source, which is what the shared pass exists to prevent.
  *
  * @param {any} page
- * @returns {Promise<{ ok: boolean, wrapped: import('./chatgpt-response-dom.mjs').ChatGptCorrelatedSnapshot[], wrapperless: import('./chatgpt-response-dom.mjs').ChatGptCorrelatedSnapshot[] }>}
+ * @param {{ submittedUserMessageId?: string|null, submittedUserTurnId?: string|null, responseMessageId?: string|null, responseTurnId?: string|null }} [anchor]
+ * @returns {Promise<{ ok: boolean, userAnchorFound: boolean, responseAnchorFound: boolean, wrapped: import('./chatgpt-response-dom.mjs').ChatGptCorrelatedSnapshot[], wrapperless: import('./chatgpt-response-dom.mjs').ChatGptCorrelatedSnapshot[] }>}
  */
-async function readAssistantSnapshotsSplit(page) {
+async function readAssistantSnapshotsSplit(page, anchor = {}) {
     // `ok:false` means the acquisition FAILED — distinct from a successful read
     // that found nothing. Only the failure case may fall back to a legacy reader.
-    const failed = { ok: false, wrapped: [], wrapperless: [] };
+    const failed = { ok: false, userAnchorFound: false, responseAnchorFound: false, wrapped: [], wrapperless: [] };
     try {
         const result = await evaluateWithTimeout(page, readAssistantSnapshotSources, {
             assistantSelectors: ASSISTANT_SELECTORS,
             resolverSource: resolveTopLevelAssistantTurns.toString(),
+            submittedUserMessageId: anchor.submittedUserMessageId || null,
+            submittedUserTurnId: anchor.submittedUserTurnId || null,
+            responseMessageId: anchor.responseMessageId || null,
+            responseTurnId: anchor.responseTurnId || null,
         });
         if (!result || typeof result !== 'object'
             || !Array.isArray(result.wrapped)
             || !Array.isArray(result.wrapperless)) return failed;
-        return { ok: result.ok === true, wrapped: result.wrapped, wrapperless: result.wrapperless };
+        return {
+            ok: result.ok === true,
+            userAnchorFound: result.userAnchorFound === true,
+            responseAnchorFound: result.responseAnchorFound === true,
+            wrapped: result.wrapped,
+            wrapperless: result.wrapperless,
+        };
     } catch {
         return failed;
     }
@@ -2142,9 +2333,9 @@ async function collectGeneratedImageAnswer(deps, input, session, baseline, still
 }
 
 /**
- * @param {{ vendor: string, page: any, session: any, baseline: any, answerText: string, usedFallbacks: string[], warning: string, streamingState: string }} input
+ * @param {{ vendor: string, page: any, session: any, generation: number, baseline: any, answerText: string, usedFallbacks: string[], warning: string, streamingState: string }} input
  */
-async function buildDeferredPollingResult({ vendor, page, session, baseline, answerText, usedFallbacks, warning, streamingState, observations, stillActive }) {
+async function buildDeferredPollingResult({ vendor, page, session, generation, baseline, answerText, usedFallbacks, warning, streamingState, observations, stillActive }) {
     const warnings = observations
         ? mergeObservationList([warning], observations)
         : [warning];
@@ -2155,7 +2346,7 @@ async function buildDeferredPollingResult({ vendor, page, session, baseline, ans
     // about the moment the write landed. The warning merge is made against the
     // row read INSIDE that same lock — a pre-lock read let a warning appended
     // between the two locks be erased by this write.
-    const written = await mutateSessionAsync(session.sessionId, (current) => {
+    const written = await mutateSessionForGeneration(session.sessionId, generation, (current) => {
         let storedWarnings = current.warnings || [];
         for (const entry of warnings) storedWarnings = appendUniqueWarningLocal(storedWarnings, entry);
         return {
@@ -2168,12 +2359,16 @@ async function buildDeferredPollingResult({ vendor, page, session, baseline, ans
         };
     }, stillActive);
     if (written === DEADLINE_PASSED) throw POLL_EXPIRED;
+    if (written === GENERATION_CHANGED) {
+        return buildGenerationSupersededResult(vendor, session, generation);
+    }
     return {
         ok: true,
         vendor,
         status: 'polling',
         url: page.url(),
         sessionId: session.sessionId,
+        generation,
         answerText,
         baseline,
         usedFallbacks,
@@ -2277,12 +2472,96 @@ function appendUniqueWarningLocal(warnings, warning) {
 }
 
 /**
+ * Read the exact user turn created by the just-committed prompt. This is the
+ * causal cursor for response collection; mounted assistant counts are only
+ * diagnostics because ChatGPT virtualizes old turns.
+ *
+ * @param {any} page
+ * @returns {Promise<{ messageId: string|null, turnId: string|null }>}
+ */
+async function readSubmittedUserTurnAnchor(page) {
+    let anchor = null;
+    try {
+        anchor = await evaluateWithTimeout(page, readLatestUserTurnIdentity, {}, 10_000);
+    } catch { /* typed failure below */ }
+    if (anchor && (anchor.messageId || anchor.turnId)) {
+        return {
+            messageId: typeof anchor.messageId === 'string' ? anchor.messageId : null,
+            turnId: typeof anchor.turnId === 'string' ? anchor.turnId : null,
+        };
+    }
+    throw new WebAiError({
+        errorCode: 'session.turn-anchor-unresolved',
+        stage: 'response-correlation',
+        retryHint: 'poll-or-resume',
+        vendor: 'chatgpt',
+        mutationAllowed: true,
+        message: 'ChatGPT committed the prompt but the submitted user turn had no stable message or turn id',
+    });
+}
+
+/**
+ * Wait until ChatGPT assigns the durable `/c/<id>` URL after the prompt commit.
+ * A reusable logical session is not published against the provider root.
+ *
+ * @param {any} page
+ * @param {number} [timeoutMs]
+ * @returns {Promise<string>}
+ */
+async function waitForCommittedConversationUrl(page, timeoutMs = 10_000) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs));
+    let currentUrl = page.url();
+    while (!extractDurableConversationId(currentUrl) && Date.now() < deadline) {
+        await page.waitForTimeout?.(100);
+        currentUrl = page.url();
+    }
+    return currentUrl;
+}
+
+/**
+ * @param {string} sessionId
+ * @param {number} generation
+ */
+function generationSupersededError(sessionId, generation) {
+    return new WebAiError({
+        errorCode: 'session.generation-superseded',
+        stage: 'session-generation',
+        retryHint: 'use-latest-generation',
+        vendor: 'chatgpt',
+        mutationAllowed: false,
+        message: `session ${sessionId} generation ${generation} was superseded`,
+        evidence: { sessionId, generation },
+    });
+}
+
+/**
+ * @param {string} vendor
+ * @param {any} session
+ * @param {number|null} generation
+ */
+function buildGenerationSupersededResult(vendor, session, generation) {
+    return {
+        ok: false,
+        vendor,
+        status: 'superseded',
+        sessionId: session?.sessionId,
+        generation,
+        currentGeneration: sessionGeneration(getSession(session?.sessionId) || session),
+        answerText: '',
+        warnings: ['session-generation-superseded'],
+        usedFallbacks: [],
+        recoverable: false,
+        errorCode: 'session.generation-superseded',
+        retryHint: 'use-latest-generation',
+        error: 'a newer prompt generation owns this session',
+    };
+}
+
+/**
  * @param {string|null|undefined} url
  */
 function extractConversationId(url) {
-    if (!url) return null;
-    const match = url.match(/\/c\/([a-f0-9-]+)/);
-    return match ? match[1] : null;
+    return extractDurableConversationId(url);
 }
 
 /** @param {any} text */

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -27,7 +27,7 @@ vi.mock('../../skills/browser/tab-manager.mjs', () => ({
     createTab: vi.fn(), waitForPageByTargetId: vi.fn(), listManagedTabs: vi.fn(), closeTab: vi.fn(),
 }));
 
-import { hasStreamingIndicator, watchSessionOnce } from '../../web-ai/watcher.mjs';
+import { acquireWatcherSessionLock, hasStreamingIndicator, watchSessionOnce } from '../../web-ai/watcher.mjs';
 import { createSession, getSession, updateSession } from '../../web-ai/session.mjs';
 
 const ORIGINAL_HOME = process.env.BROWSER_AGENT_HOME;
@@ -50,24 +50,21 @@ afterEach(() => {
 const watcherSrc = readFileSync(join(process.cwd(), 'web-ai/watcher.mjs'), 'utf8');
 
 describe('web-ai watcher transient-timeout promotion (source-string contract)', () => {
-    it('imports withSessionCommandLock from session-store', () => {
-        expect(watcherSrc).toContain("import { withSessionCommandLock } from './session-store.mjs'");
+    it('uses generation-fenced writes instead of a long session command lock', () => {
+        expect(watcherSrc).toContain('updateSessionForGeneration');
+        expect(watcherSrc).toContain('GENERATION_CHANGED');
+        expect(watcherSrc).not.toContain('withSessionCommandLock');
     });
 
-    it('promotes a pre-deadline timeout back to polling inside the session command lock', () => {
-        // The promotion block must check status === 'timeout' AND !isDeadlineExpired,
-        // and the mutation must happen inside withSessionCommandLock.
+    it('promotes a pre-deadline timeout only for the generation that observed it', () => {
         expect(watcherSrc).toMatch(
-            /session\.status === 'timeout' && !isDeadlineExpired\(session\.deadlineAt\)[\s\S]*?await withSessionCommandLock\(session\.sessionId/,
+            /session\.status === 'timeout' && !isDeadlineExpired\(session\.deadlineAt\)[\s\S]*?restorePollingBeforeDeadline\([\s\S]*?generation/,
         );
     });
 
-    it('re-reads session inside the lock to avoid clobbering a concurrent live poll', () => {
-        expect(watcherSrc).toMatch(/withSessionCommandLock\(session\.sessionId, async \(\) =>[\s\S]*?const refreshed = getSession\(session\.sessionId\)/);
-    });
-
-    it('uses short ttl and disables heartbeat for the status flip', () => {
-        expect(watcherSrc).toMatch(/\{\s*ttlMs:\s*30_000,\s*heartbeatMs:\s*0\s*\}/);
+    it('stops the old watcher when the session generation changes', () => {
+        expect(watcherSrc).toContain("status: 'superseded'");
+        expect(watcherSrc).toContain("errorCode: 'session.generation-superseded'");
     });
 
     it('still treats a deadline-expired timeout as terminal', () => {
@@ -118,10 +115,47 @@ describe('web-ai watcher streaming guard', () => {
         await expect(hasStreamingIndicator(page, 'gemini')).resolves.toBe(false);
     });
 
-    it('contains a complete-plus-streaming downgrade path', () => {
-        expect(watcherSrc).toContain('watcher-complete-deferred-streaming');
-        expect(watcherSrc).toMatch(/status === 'complete' && await hasStreamingIndicator\(page, vendor\)/);
-        expect(watcherSrc).toMatch(/status:\s*'polling'[\s\S]*?terminal:\s*false/);
+    it('never downgrades completed evidence because an ambient stop control is visible', async () => {
+        const session = createWatcherSession();
+        const completedAt = new Date().toISOString();
+        updateSession(session.sessionId, { status: 'complete', answer: 'done', completedAt });
+        tabState.page = fakeVisibilityPage({
+            'button[data-testid="stop-button"]': true,
+        });
+
+        const result = await watchSessionOnce(baseDeps(), { session: session.sessionId });
+
+        expect(result).toMatchObject({ status: 'complete', terminal: true, answerText: 'done' });
+        expect(getSession(session.sessionId)).toMatchObject({
+            status: 'complete', answer: 'done', completedAt,
+        });
+        expect(watcherSrc).not.toContain('watcher-complete-deferred-streaming');
+    });
+});
+
+describe('watcher lock ownership token', () => {
+    it('does not let a stale owner heartbeat or release a replacement lock', () => {
+        const sessionId = 'watcher-lock-aba';
+        const first = acquireWatcherSessionLock(sessionId, { staleMs: 1 });
+        const metadataPath = join(first.lockPath, 'metadata.json');
+        const firstMetadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+        writeFileSync(metadataPath, JSON.stringify({
+            ...firstMetadata,
+            pid: 2_147_483_646,
+            heartbeatAt: '1970-01-01T00:00:00.000Z',
+        }));
+
+        const second = acquireWatcherSessionLock(sessionId, { staleMs: 1 });
+        const secondMetadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+        expect(secondMetadata.ownerToken).not.toBe(firstMetadata.ownerToken);
+
+        expect(first.heartbeat({ iteration: 99 })).toBe(false);
+        first.release();
+
+        expect(existsSync(metadataPath)).toBe(true);
+        expect(JSON.parse(readFileSync(metadataPath, 'utf8')).ownerToken).toBe(secondMetadata.ownerToken);
+        second.release();
+        expect(existsSync(first.lockPath)).toBe(false);
     });
 });
 

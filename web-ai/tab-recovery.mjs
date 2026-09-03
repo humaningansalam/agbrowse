@@ -1,10 +1,19 @@
 // @ts-check
 import { createTab, probeTabAlive, getPageByTargetId, waitForPageByTargetId, listManagedTabs, closeTab } from '../skills/browser/tab-manager.mjs';
-import { DEADLINE_PASSED, updateSession, updateSessionAsync, getSession, incrementRecoveryCount, listSessions } from './session.mjs';
-import { mutateSessionAsync } from './session-store.mjs';
-import { waitForConversationReady, isProviderUrl } from './navigation-ready.mjs';
+import {
+    bindSessionConversation,
+    DEADLINE_PASSED,
+    GENERATION_CHANGED,
+    getSession,
+    listSessions,
+    sessionConversationId,
+    sessionGeneration,
+    updateSession,
+    updateSessionForGeneration,
+} from './session.mjs';
+import { waitForConversationReady } from './navigation-ready.mjs';
 import { isWorkSession as _isWorkSession } from './chatgpt-work-picker.mjs';
-import { isDurableConversationUrl } from './conversation-url.mjs';
+import { extractDurableConversationId, isDurableConversationUrl } from './conversation-url.mjs';
 import { WebAiError } from './errors.mjs';
 
 /** @typedef {import('./session-store.mjs').WebAiSession} WebAiSession */
@@ -37,6 +46,7 @@ export async function recoverSessionTab(deps, session, options = {}) {
     const port = deps.getPort();
     const stillActive = options.stillActive;
     const targetUrl = session.conversationUrl || session.originalUrl || 'about:blank';
+    const generation = sessionGeneration(session);
     const isRunningWork = _isWorkSession(session) && session.status !== 'complete';
 
     // Work-session guard (04 section 6, round-2): a running Work session with a
@@ -51,7 +61,8 @@ export async function recoverSessionTab(deps, session, options = {}) {
         );
     }
 
-    // 1. Check if original tab still exists
+    // 1. Observe the exact stored target. A target that is alive or whose
+    // liveness is unknown is never navigated or replaced by recovery.
     const liveness = await probeTabAlive(port, /** @type {string} */ (session.targetId));
     // A tab we could not observe is not a tab we may replace: creating a new one
     // here would rebind the session target and abandon a live conversation.
@@ -63,105 +74,158 @@ export async function recoverSessionTab(deps, session, options = {}) {
             reason: 'tab liveness could not be verified',
         };
     }
-    const alive = liveness === 'alive';
-
-    if (alive) {
-        // Tab exists - verify URL by checking the actual page
-        const page = await getPageByTargetId(port, /** @type {string} */ (session.targetId));
-        if (page) {
-            try {
-                const currentUrl = page.url();
-
-                // Work-session guard: for running Work sessions, verify the tab
-                // shows the correct task URL, not a random chatgpt.com home tab.
-                if (isRunningWork && !isWorkTabUrlConsistent(session, currentUrl)) {
-                    throw new Error(
-                        `Work session ${session.sessionId} tab URL (${currentUrl}) ` +
-                        `is not consistent with task; failing closed. ` +
-                        `Error: provider.work-reattach-unverified`
-                    );
-                }
-
-                if (shouldPreferCurrentProviderUrl(targetUrl, currentUrl)) {
-                    const binding = await updateRecoveryBinding(session.sessionId, { conversationUrl: currentUrl }, stillActive);
-                    if (binding === DEADLINE_PASSED) return deadlineRecoveryFailure('existing-tab', session.targetId);
+    if (liveness === 'alive') {
+        const page = await getPageByTargetId(port, /** @type {string} */ (session.targetId)).catch(() => null);
+        if (!page) {
+            return {
+                recovered: false,
+                strategy: 'unverified',
+                liveness: 'alive',
+                targetId: session.targetId,
+                reason: 'live target could not be attached',
+            };
+        }
+        let currentUrl;
+        try {
+            currentUrl = /** @type {any} */ (page).url();
+        } catch {
+            return {
+                recovered: false,
+                strategy: 'unverified',
+                liveness: 'alive',
+                targetId: session.targetId,
+                reason: 'live target URL could not be read',
+            };
+        }
+        if (isRunningWork && !isWorkTabUrlConsistent(session, currentUrl)) {
+            return {
+                recovered: false,
+                strategy: 'existing-tab',
+                liveness: 'alive',
+                targetId: session.targetId,
+                reason: 'work-conversation-mismatch',
+            };
+        }
+        if (session.vendor === 'chatgpt') {
+            const expectedConversationId = sessionConversationId(session);
+            const actualConversationId = extractDurableConversationId(currentUrl);
+            if (expectedConversationId && actualConversationId !== expectedConversationId) {
+                return {
+                    recovered: false,
+                    strategy: 'existing-tab',
+                    liveness: 'alive',
+                    targetId: session.targetId,
+                    reason: 'conversation-mismatch',
+                };
+            }
+            if (!expectedConversationId && actualConversationId) {
+                const bound = await bindSessionConversation(
+                    session.sessionId,
+                    generation,
+                    currentUrl,
+                    stillActive,
+                );
+                if (bound === DEADLINE_PASSED) return deadlineRecoveryFailure('existing-tab', session.targetId);
+                if (bound === GENERATION_CHANGED) {
                     return {
-                        recovered: true,
+                        recovered: false,
                         strategy: 'existing-tab',
-                        targetId: session.targetId
+                        targetId: session.targetId,
+                        reason: 'generation-superseded',
                     };
                 }
-                if (currentUrl !== targetUrl) {
-                    await page.goto(targetUrl, { waitUntil: 'load', timeout: 30_000 });
-                }
-                const finalUrl = page.url();
-                await waitForConversationReady(page, finalUrl);
-                if (finalUrl !== targetUrl && isProviderUrl(finalUrl)) {
-                    const binding = await updateRecoveryBinding(session.sessionId, { conversationUrl: finalUrl }, stillActive);
-                    if (binding === DEADLINE_PASSED) return deadlineRecoveryFailure('existing-tab', session.targetId);
-                }
-                return {
-                    recovered: true,
-                    strategy: 'existing-tab',
-                    targetId: session.targetId
-                };
-            } catch {
-                // CDP can report the target as alive while Playwright has already
-                // closed the page object. Fall through to a fresh tab recovery.
             }
+        } else if (targetUrl !== 'about:blank' && !urlsCompatible(targetUrl, currentUrl)) {
+            return {
+                recovered: false,
+                strategy: 'existing-tab',
+                liveness: 'alive',
+                targetId: session.targetId,
+                reason: 'conversation-mismatch',
+            };
         }
+        return {
+            recovered: true,
+            strategy: 'existing-tab',
+            liveness: 'alive',
+            targetId: session.targetId,
+        };
     }
 
-    // 2. Create new tab
-    const newTab = await createTab(port, targetUrl);
+    // 2. Only a positively gone target may be replaced. ChatGPT recovery
+    // requires the exact durable /c/<id> URL already owned by this session.
+    if (liveness !== 'gone') {
+        return {
+            recovered: false,
+            strategy: 'unverified',
+            liveness,
+            targetId: session.targetId,
+            reason: 'target-not-proven-gone',
+        };
+    }
+    if (session.vendor === 'chatgpt' && !isDurableConversationUrl(targetUrl)) {
+        return {
+            recovered: false,
+            strategy: 'new-tab',
+            liveness: 'gone',
+            targetId: session.targetId,
+            reason: 'unsafe-conversation-url',
+        };
+    }
+
+    const newTab = await createTab(port, 'about:blank', { activate: false, reuseBlank: false });
     try {
         let recoveredConversationUrl = session.conversationUrl || targetUrl;
         if (targetUrl !== 'about:blank') {
             const newPage = await waitForPageByTargetId(port, newTab.targetId).catch(() => null);
-            if (newPage) {
-                await /** @type {any} */ (newPage).waitForLoadState?.('load').catch(() => undefined);
-                const finalUrl = /** @type {any} */ (newPage).url();
-                await waitForConversationReady(newPage, finalUrl);
-                if (finalUrl !== targetUrl && isProviderUrl(finalUrl)) {
-                    recoveredConversationUrl = finalUrl;
+            if (!newPage) throw new Error(`recovery target ${newTab.targetId} could not be attached`);
+            await /** @type {any} */ (newPage).goto(targetUrl, { waitUntil: 'load', timeout: 30_000 });
+            const finalUrl = /** @type {any} */ (newPage).url();
+            await waitForConversationReady(newPage, finalUrl);
+            if (session.vendor === 'chatgpt') {
+                const expectedConversationId = sessionConversationId(session);
+                const actualConversationId = extractDurableConversationId(finalUrl);
+                if (!expectedConversationId || actualConversationId !== expectedConversationId) {
+                    throw new Error(
+                        `recovered conversation mismatch: expected ${expectedConversationId || 'unknown'}, got ${actualConversationId || 'unverified'}`,
+                    );
                 }
+                recoveredConversationUrl = session.conversationUrl || targetUrl;
+            } else if (!urlsCompatible(targetUrl, finalUrl)) {
+                throw new Error(`recovered URL ${finalUrl} does not match ${targetUrl}`);
+            } else {
+                recoveredConversationUrl = finalUrl;
             }
         }
 
         // 3. Update session binding
-        const binding = stillActive
-            ? await mutateSessionAsync(session.sessionId, current => {
-                const patch = {
-                    targetId: newTab.targetId,
-                    tabState: {
-                        ...current.tabState,
-                        recoveryCount: (current.tabState?.recoveryCount || 0) + 1,
-                        lastActiveAt: new Date().toISOString(),
-                    },
-                    updatedAt: new Date().toISOString(),
-                };
-                if (current.vendor !== 'chatgpt' || isDurableConversationUrl(recoveredConversationUrl)) {
-                    (/** @type {Record<string, unknown>} */ (patch)).conversationUrl = recoveredConversationUrl;
-                }
-                return patch;
-            }, stillActive)
-            : await updateSession(session.sessionId, {
-                targetId: newTab.targetId,
-                conversationUrl: recoveredConversationUrl,
-                tabState: {
-                    ...session.tabState,
-                    recoveryCount: (session.tabState?.recoveryCount || 0) + 1,
-                    lastActiveAt: new Date().toISOString(),
-                }
-            });
+        const binding = await updateSessionForGeneration(session.sessionId, generation, {
+            targetId: newTab.targetId,
+            ...(session.vendor === 'chatgpt' ? {} : { conversationUrl: recoveredConversationUrl }),
+            tabState: {
+                ...session.tabState,
+                recoveryCount: (session.tabState?.recoveryCount || 0) + 1,
+                lastActiveAt: new Date().toISOString(),
+            },
+        }, stillActive);
         if (binding === DEADLINE_PASSED) {
             await closeTab(port, newTab.targetId).catch(() => undefined);
             return deadlineRecoveryFailure('new-tab', newTab.targetId);
+        }
+        if (binding === GENERATION_CHANGED) {
+            await closeTab(port, newTab.targetId).catch(() => undefined);
+            return {
+                recovered: false,
+                strategy: 'new-tab',
+                targetId: newTab.targetId,
+                reason: 'generation-superseded',
+            };
         }
 
         return {
             recovered: true,
             strategy: 'new-tab',
+            liveness: 'gone',
             targetId: newTab.targetId
         };
     } catch (err) {
@@ -169,19 +233,6 @@ export async function recoverSessionTab(deps, session, options = {}) {
         await closeTab(port, newTab.targetId).catch(() => undefined);
         throw err;
     }
-}
-
-/**
- * Preserve the legacy synchronous binding write unless a deadline predicate is
- * explicitly supplied by a poll/recovery caller.
- * @param {string} sessionId
- * @param {Record<string, unknown>} patch
- * @param {(() => boolean)|undefined} stillActive
- */
-function updateRecoveryBinding(sessionId, patch, stillActive) {
-    return stillActive
-        ? updateSessionAsync(sessionId, patch, stillActive)
-        : updateSession(sessionId, patch);
 }
 
 /**
@@ -228,11 +279,11 @@ export async function verifySessionTab(deps, session) {
 
     if (alive) {
         const page = await getPageByTargetId(deps.getPort(), session.targetId).catch(() => null);
-        if (!page) return { valid: false, targetId: session.targetId, needsRecovery: true, liveness: 'alive' };
+        if (!page) return { valid: false, targetId: session.targetId, needsRecovery: false, liveness: 'unknown' };
         try {
             page.url();
         } catch {
-            return { valid: false, targetId: session.targetId, needsRecovery: true, liveness: 'alive' };
+            return { valid: false, targetId: session.targetId, needsRecovery: false, liveness: 'unknown' };
         }
         return { valid: true, targetId: session.targetId, needsRecovery: false, liveness: 'alive' };
     }
@@ -543,12 +594,11 @@ export function urlsCompatible(storedUrl, liveUrl) {
  *
  * @param {RecoverDeps} deps
  * @param {string} sessionId
- * @param {{ allowNavigate?: boolean, forceRecover?: boolean, stillActive?: () => boolean }} [options]
+ * @param {{ allowNavigate?: boolean, stillActive?: () => boolean }} [options]
  * @returns {Promise<ResolveSessionPageResult>}
  */
 export async function resolveSessionPage(deps, sessionId, options = {}) {
-    const allowNavigate = options.allowNavigate !== false;
-    const forceRecover = options.forceRecover === true;
+    const allowNavigate = options.allowNavigate === true;
     const stillActive = options.stillActive;
 
     const session = getSession(sessionId);
@@ -562,7 +612,7 @@ export async function resolveSessionPage(deps, sessionId, options = {}) {
 
     // Liveness unverified: do not recover, do not claim we did. Reported as its
     // own variant so callers can retry rather than treat the tab as unusable.
-    if (liveness === 'unknown' && !forceRecover) {
+    if (liveness === 'unknown') {
         return {
             mismatch: true,
             page: null,
@@ -577,7 +627,7 @@ export async function resolveSessionPage(deps, sessionId, options = {}) {
         };
     }
 
-    if (!valid || forceRecover) {
+    if (!valid) {
         if (!allowNavigate) {
             // Stored tab is closed/dead and caller did not authorize navigation.
             return {
@@ -593,7 +643,7 @@ export async function resolveSessionPage(deps, sessionId, options = {}) {
             };
         }
         const recoveryTargetUrl = storedUrl;
-        if ((needsRecovery || forceRecover) && recoveryTargetUrl) {
+        if (needsRecovery && recoveryTargetUrl) {
             const recovery = await recoverSessionTab(deps, current, { stillActive });
             // `unverified` means the probe failed, not that recovery failed.
             // Collapsing it into the generic throw loses the one detail that
@@ -614,6 +664,19 @@ export async function resolveSessionPage(deps, sessionId, options = {}) {
             }
             if (!recovery.recovered) {
                 if (recovery.reason === 'deadline-passed') return deadlineResolveFailure(current, recovery.strategy);
+                if (recovery.reason === 'generation-superseded') {
+                    return {
+                        mismatch: true,
+                        page: null,
+                        targetId: current.targetId || null,
+                        session: current,
+                        recovered: false,
+                        strategy: recovery.strategy,
+                        warnings: [`session ${sessionId} generation was superseded during recovery`],
+                        url: null,
+                        conversationUrl: current.conversationUrl || null,
+                    };
+                }
                 throw new Error(`Session ${sessionId} tab recovery failed`);
             }
             const recovered = /** @type {WebAiSession} */ (getSession(sessionId));
@@ -637,12 +700,61 @@ export async function resolveSessionPage(deps, sessionId, options = {}) {
     const page = await getPageByTargetId(port, /** @type {string} */ (current.targetId));
     if (!page) throw new Error(`Session ${sessionId} page not found for targetId ${current.targetId}`);
 
-    if (current.conversationUrl && page.url() !== current.conversationUrl) {
-        const liveUrl = page.url();
-        if (shouldPreferCurrentProviderUrl(current.conversationUrl, liveUrl)) {
-            const binding = await updateRecoveryBinding(sessionId, { conversationUrl: liveUrl }, stillActive);
+    let liveUrl = page.url();
+    if (_isWorkSession(current) && current.status !== 'complete') {
+        if (isWorkSessionWithBareOrigin(current) || !isWorkTabUrlConsistent(current, liveUrl)) {
+            return {
+                mismatch: true,
+                page: null,
+                targetId: /** @type {string} */ (current.targetId),
+                session: current,
+                recovered: false,
+                strategy: 'existing-tab',
+                warnings: [`Work session ${sessionId} target is not the saved task conversation; refusing navigation. Error: provider.work-reattach-unverified`],
+                url: liveUrl,
+                conversationUrl: current.conversationUrl,
+            };
+        }
+    }
+
+    if (current.vendor === 'chatgpt') {
+        const expectedConversationId = sessionConversationId(current);
+        const actualConversationId = extractDurableConversationId(liveUrl);
+        if (expectedConversationId && actualConversationId !== expectedConversationId) {
+            return {
+                mismatch: true,
+                page: null,
+                targetId: /** @type {string} */ (current.targetId),
+                session: current,
+                recovered: false,
+                strategy: 'existing-tab',
+                warnings: [`current target shows conversation ${actualConversationId || 'unverified'}, expected ${expectedConversationId}; refusing hidden navigation`],
+                url: liveUrl,
+                conversationUrl: current.conversationUrl,
+            };
+        }
+        if (!expectedConversationId && actualConversationId) {
+            const binding = await bindSessionConversation(
+                sessionId,
+                sessionGeneration(current),
+                liveUrl,
+                stillActive,
+            );
             if (binding === DEADLINE_PASSED) return deadlineResolveFailure(current, 'existing-tab');
-            const updated = /** @type {WebAiSession} */ (getSession(sessionId));
+            if (binding === GENERATION_CHANGED) {
+                return {
+                    mismatch: true,
+                    page: null,
+                    targetId: /** @type {string} */ (current.targetId),
+                    session: current,
+                    recovered: false,
+                    strategy: 'existing-tab',
+                    warnings: [`session ${sessionId} generation changed while binding conversation identity`],
+                    url: liveUrl,
+                    conversationUrl: current.conversationUrl,
+                };
+            }
+            const updated = /** @type {WebAiSession} */ (binding || getSession(sessionId));
             return {
                 mismatch: false,
                 page,
@@ -655,73 +767,26 @@ export async function resolveSessionPage(deps, sessionId, options = {}) {
                 conversationUrl: updated.conversationUrl || null,
             };
         }
+    } else if (current.conversationUrl && !urlsCompatible(current.conversationUrl, liveUrl)) {
+        // Non-ChatGPT providers retain explicit-navigation compatibility. The
+        // immutable conversation contract in this release applies to the
+        // ChatGPT Director/Expert path.
         if (!allowNavigate) {
-            const drifted = !urlsCompatible(current.conversationUrl, liveUrl);
-            if (drifted) {
-                return {
-                    mismatch: true,
-                    page: null,
-                    targetId: /** @type {string} */ (current.targetId),
-                    session: current,
-                    recovered: false,
-                    strategy: 'existing-tab',
-                    warnings: [`current tab ${liveUrl} does not match session conversationUrl ${current.conversationUrl}; pass --navigate to switch tabs`],
-                    url: liveUrl,
-                    conversationUrl: current.conversationUrl,
-                };
-            }
-        } else {
-            // Work-session guard (round-2): for running Work sessions, also reject
-            // bare-origin conversationUrl via the same mismatch path.
-            if (_isWorkSession(current) && current.status !== 'complete' && isWorkSessionWithBareOrigin(current)) {
-                return {
-                    mismatch: true,
-                    page: null,
-                    targetId: /** @type {string} */ (current.targetId),
-                    session: current,
-                    recovered: false,
-                    strategy: 'existing-tab',
-                    warnings: [`Work session ${sessionId} has bare-origin conversationUrl (${current.conversationUrl}); refusing to navigate. Error: provider.work-reattach-unverified`],
-                    url: liveUrl,
-                    conversationUrl: current.conversationUrl,
-                };
-            }
-            // 32.3 fail-closed: never navigate a ChatGPT session to a non-concrete
-            // target (provider root / foreign host / non-/c/ path) — that would
-            // open a new chat or the wrong thread instead of recovering this one.
-            if (current.vendor === 'chatgpt' && !isSafeChatGptConversationUrl(current.conversationUrl)) {
-                return {
-                    mismatch: true,
-                    page: null,
-                    targetId: /** @type {string} */ (current.targetId),
-                    session: current,
-                    recovered: false,
-                    strategy: 'existing-tab',
-                    warnings: [`refusing to navigate to unsafe ChatGPT target ${current.conversationUrl}; not a concrete /c/<id> conversation`],
-                    url: liveUrl,
-                    conversationUrl: current.conversationUrl,
-                };
-            }
-            await page.goto(current.conversationUrl, { waitUntil: 'load', timeout: 30_000 });
-            const finalUrl = page.url();
-            await waitForConversationReady(page, finalUrl);
-            if (finalUrl !== current.conversationUrl && isProviderUrl(finalUrl)) {
-                const binding = await updateRecoveryBinding(sessionId, { conversationUrl: finalUrl }, stillActive);
-                if (binding === DEADLINE_PASSED) return deadlineResolveFailure(current, 'existing-tab');
-                const updated = /** @type {WebAiSession} */ (getSession(sessionId));
-                return {
-                    mismatch: false,
-                    page,
-                    targetId: /** @type {string} */ (current.targetId),
-                    session: updated,
-                    recovered: false,
-                    strategy: 'existing-tab',
-                    warnings: [],
-                    url: finalUrl,
-                    conversationUrl: updated.conversationUrl || null,
-                };
-            }
+            return {
+                mismatch: true,
+                page: null,
+                targetId: /** @type {string} */ (current.targetId),
+                session: current,
+                recovered: false,
+                strategy: 'existing-tab',
+                warnings: [`current tab ${liveUrl} does not match session conversationUrl ${current.conversationUrl}`],
+                url: liveUrl,
+                conversationUrl: current.conversationUrl,
+            };
         }
+        await page.goto(current.conversationUrl, { waitUntil: 'load', timeout: 30_000 });
+        liveUrl = page.url();
+        await waitForConversationReady(page, liveUrl);
     }
 
     return {
@@ -732,7 +797,7 @@ export async function resolveSessionPage(deps, sessionId, options = {}) {
         recovered: false,
         strategy: 'existing-tab',
         warnings: [],
-        url: page.url?.() || current.conversationUrl || current.originalUrl || '',
+        url: liveUrl || current.conversationUrl || current.originalUrl || '',
         conversationUrl: current.conversationUrl || null,
     };
 }
@@ -785,16 +850,51 @@ export async function withSessionPageGuarded(deps, sessionId, fn, options = {}) 
     const stillActive = options.stillActive;
     const first = await resolveSessionPage(deps, sessionId, { allowNavigate: true, stillActive });
     if (/** @type {any} */ (first).strategy === 'unverified') throw livenessUnverifiedError(sessionId, deps, first);
-    if (first.mismatch) throw new Error(`Session ${sessionId} resolver returned mismatch with allowNavigate=true`);
+    if (first.mismatch) throw sessionPageMismatchError(sessionId, first);
     try {
         return await fn(/** @type {ResolvedPage<T>} */ ({ page: first.page, targetId: first.targetId, session: first.session }));
     } catch (err) {
         if (!isPageDeathError(err)) throw err;
-        const recovered = await resolveSessionPage(deps, sessionId, { allowNavigate: true, forceRecover: true, stillActive });
+        // Re-probe after page death. The resolver may create a replacement only
+        // when the exact target is positively reported gone.
+        const recovered = await resolveSessionPage(deps, sessionId, { allowNavigate: true, stillActive });
         if (/** @type {any} */ (recovered).strategy === 'unverified') throw livenessUnverifiedError(sessionId, deps, recovered);
-        if (recovered.mismatch) throw new Error(`Session ${sessionId} recovery resolver returned mismatch with allowNavigate=true`);
+        if (recovered.mismatch) throw sessionPageMismatchError(sessionId, recovered);
         return fn(/** @type {ResolvedPage<T>} */ ({ page: recovered.page, targetId: recovered.targetId, session: recovered.session }));
     }
+}
+
+/**
+ * Preserve strict target/conversation mismatch as a typed non-mutating error.
+ *
+ * @param {string} sessionId
+ * @param {ResolveSessionPageMismatch} resolved
+ */
+function sessionPageMismatchError(sessionId, resolved) {
+    const expectedConversationId = sessionConversationId(resolved.session);
+    const actualConversationId = extractDurableConversationId(resolved.url);
+    const generationSuperseded = resolved.warnings.some((warning) => warning.includes('generation'));
+    return new WebAiError({
+        errorCode: generationSuperseded
+            ? 'session.generation-superseded'
+            : expectedConversationId
+                ? 'session.conversation-mismatch'
+                : 'cdp.target-mismatch',
+        stage: generationSuperseded ? 'session-generation' : 'target-resolution',
+        vendor: resolved.session.vendor || undefined,
+        retryHint: generationSuperseded ? 'use-latest-generation' : 'use-correct-session',
+        mutationAllowed: false,
+        message: resolved.warnings[0] || `session ${sessionId} target identity mismatch`,
+        evidence: {
+            sessionId,
+            generation: sessionGeneration(resolved.session),
+            expectedTargetId: resolved.session.targetId || null,
+            actualTargetId: resolved.targetId || null,
+            expectedConversationId,
+            actualConversationId,
+            url: resolved.url || null,
+        },
+    });
 }
 
 /**
@@ -849,17 +949,3 @@ function livenessUnverifiedError(sessionId, deps, resolved) {
  * @param {string|null|undefined} savedUrl
  * @param {string|null|undefined} currentUrl
  */
-function shouldPreferCurrentProviderUrl(savedUrl, currentUrl) {
-    if (!savedUrl || !currentUrl || savedUrl === currentUrl) return false;
-    if (!isProviderUrl(savedUrl) || !isProviderUrl(currentUrl)) return false;
-    try {
-        const saved = new URL(savedUrl);
-        const current = new URL(currentUrl);
-        if (saved.origin !== current.origin) return false;
-        const savedPath = saved.pathname.replace(/\/+$/, '') || '/';
-        const currentPath = current.pathname.replace(/\/+$/, '') || '/';
-        return savedPath === '/' && currentPath !== '/';
-    } catch {
-        return false;
-    }
-}

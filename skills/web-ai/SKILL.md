@@ -163,7 +163,7 @@ Think, Deep Research), do not block your agent turn on `query`. Split into
 SID=$(agbrowse web-ai send --vendor chatgpt --model pro --inline-only \
   --prompt "..." --json | jq -r .sessionId)
 # separate/background process:
-agbrowse web-ai watch --session "$SID" --json --navigate
+agbrowse web-ai watch --session "$SID" --json
 ```
 
 Key facts (verified 2026-06-11, details in
@@ -803,10 +803,11 @@ Set `AGBROWSE_JSON_ERRORS=1` for agent integrations. When set (or when the
 command was invoked with `--json`), any failure is printed on stderr as a
 parseable envelope: `{ "ok": false, "status": "error", "error": { ... } }`.
 
-Poll-stage target drift is a command result with `ok: false`,
-`status: "target-mismatch"`, `expectedTargetId`, `actualTargetId`, `port`,
-`targetMismatch`, and a `recovery` command such as
-`agbrowse web-ai poll --vendor chatgpt --session <id> --navigate --json`.
+Poll-stage target drift is a command result with `ok: false` and structured
+target evidence. A positively gone target can be recovered only at that
+session's exact saved conversation URL. A live ChatGPT target showing another
+conversation returns `session.conversation-mismatch`; `--navigate` never moves
+or rebinds that live target.
 
 Otherwise human mode prints `[web-ai error] <code>: <message>` on the first
 line and `[hint] retryHint: <hint>` on the second line. Exit code is `1`

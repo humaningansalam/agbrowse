@@ -52,7 +52,7 @@ describe('resolveSessionPage wiring (source-string contract)', () => {
     const src = readFileSync(join(process.cwd(), 'web-ai/tab-recovery.mjs'), 'utf8');
 
     it('fails closed on an unsafe ChatGPT navigate target', () => {
-        expect(src).toContain("current.vendor === 'chatgpt' && !isSafeChatGptConversationUrl(current.conversationUrl)");
-        expect(src).toContain('refusing to navigate to unsafe ChatGPT target');
+        expect(src).toContain("session.vendor === 'chatgpt' && !isDurableConversationUrl(targetUrl)");
+        expect(src).toContain("reason: 'unsafe-conversation-url'");
     });
 });

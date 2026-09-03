@@ -7,7 +7,7 @@ const recoverySrc = readFileSync(join(process.cwd(), 'web-ai/tab-recovery.mjs'),
 describe('web-ai tab-recovery resolveSessionPage surface (source-string contract)', () => {
     it('exports resolveSessionPage with an allowNavigate option', () => {
         expect(recoverySrc).toContain('export async function resolveSessionPage');
-        expect(recoverySrc).toMatch(/const allowNavigate = options\.allowNavigate !== false/);
+        expect(recoverySrc).toMatch(/const allowNavigate = options\.allowNavigate === true/);
     });
 
     it('returns a typed mismatch result when allowNavigate=false and stored target is invalid', () => {
@@ -16,19 +16,20 @@ describe('web-ai tab-recovery resolveSessionPage surface (source-string contract
         expect(recoverySrc).toContain('pass --navigate to recover');
     });
 
-    it('prefers live provider conversation URL over stale provider root', () => {
-        expect(recoverySrc).toContain('shouldPreferCurrentProviderUrl');
-        expect(recoverySrc).toContain("savedPath === '/' && currentPath !== '/'");
+    it('compares live ChatGPT targets by immutable conversation id', () => {
+        expect(recoverySrc).toContain('sessionConversationId(current)');
+        expect(recoverySrc).toContain('extractDurableConversationId(liveUrl)');
+        expect(recoverySrc).toContain('expectedConversationId && actualConversationId !== expectedConversationId');
     });
 
-    it('reattach drift case emits a warning naming the live and stored URL', () => {
-        expect(recoverySrc).toContain('does not match session conversationUrl');
-        expect(recoverySrc).toContain('pass --navigate to switch tabs');
+    it('live ChatGPT drift is a mismatch even when navigation was requested', () => {
+        expect(recoverySrc).toContain('refusing hidden navigation');
+        expect(recoverySrc).not.toContain('shouldPreferCurrentProviderUrl');
     });
 
     it('withSessionPage layers on top of resolveSessionPage with retry-on-page-death', () => {
         expect(recoverySrc).toMatch(/await resolveSessionPage\(deps, sessionId, \{ allowNavigate: true, stillActive \}\)/);
-        expect(recoverySrc).toMatch(/forceRecover:\s*true/);
+        expect(recoverySrc).not.toContain('forceRecover');
         expect(recoverySrc).toContain('isPageDeathError');
     });
 });
@@ -198,7 +199,8 @@ describe('tab-recovery work-session guards (source-string contract)', () => {
     });
 
     it('resolveSessionPage rejects bare-origin work session before navigation', () => {
-        expect(recoverySrc).toContain('_isWorkSession(current) && current.status !== \'complete\' && isWorkSessionWithBareOrigin');
+        expect(recoverySrc).toContain("_isWorkSession(current) && current.status !== 'complete'");
+        expect(recoverySrc).toContain('isWorkSessionWithBareOrigin(current) || !isWorkTabUrlConsistent(current, liveUrl)');
     });
 
     it('resolveSessionPage returns mismatch with work-reattach-unverified for bare-origin work sessions', () => {

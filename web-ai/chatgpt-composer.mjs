@@ -1,6 +1,7 @@
 // @ts-check
 import { findVisibleCandidate } from './browser-primitives.mjs';
 import { WebAiError } from './errors.mjs';
+import { readLatestUserTurnIdentity } from './chatgpt-response-dom.mjs';
 
 /** @typedef {import('playwright-core').Page} Page */
 /** @typedef {import('playwright-core').Locator} Locator */
@@ -39,6 +40,8 @@ import { WebAiError } from './errors.mjs';
  * @property {() => Promise<CDPSession>} [getCdpSession]
  * @property {number} [timeoutMs]
  * @property {number} [baselineTurns]
+ * @property {string|null} [baselineUserMessageId]
+ * @property {string|null} [baselineUserTurnId]
  * @property {number} [sendButtonTimeoutMs]
  * @property {boolean} [requireEnabledSendButton]
  */
@@ -184,7 +187,7 @@ export async function submitPromptFromComposer(page, options = {}) {
  * @param {Page} page
  * @param {string} prompt
  * @param {ComposerOptions} [options]
- * @returns {Promise<{ turnsCount: number }>}
+ * @returns {Promise<{ turnsCount: number, userMessageId?: string|null, userTurnId?: string|null }>}
  */
 export async function verifyPromptCommitted(page, prompt, options = {}) {
     const timeoutMs = Number(options.timeoutMs || DEFAULT_COMMIT_TIMEOUT_MS);
@@ -192,8 +195,24 @@ export async function verifyPromptCommitted(page, prompt, options = {}) {
     const deadline = Date.now() + timeoutMs;
     const normalizedPrompt = normalizePrompt(prompt);
     const promptPrefix = normalizedPrompt.slice(0, 120);
+    const baselineUserMessageId = options.baselineUserMessageId || null;
+    const baselineUserTurnId = options.baselineUserTurnId || null;
 
     while (Date.now() <= deadline) {
+        const userIdentity = await readLatestCommittedUserTurn(page);
+        const hasStableUserIdentity = Boolean(userIdentity?.messageId || userIdentity?.turnId);
+        const isNewUserIdentity = hasStableUserIdentity
+            && (!baselineUserMessageId || userIdentity.messageId !== baselineUserMessageId)
+            && (!baselineUserTurnId || userIdentity.turnId !== baselineUserTurnId);
+        if (isNewUserIdentity) {
+            return {
+                turnsCount: baselineTurns,
+                userMessageId: userIdentity.messageId,
+                userTurnId: userIdentity.turnId,
+            };
+        }
+        // Legacy fallback only. Current ChatGPT turns expose stable ids, so the
+        // normal commit path never scans every mounted conversation turn.
         const [turns, composerState, stopVisible, assistantVisible] = await Promise.all([
             readConversationTurns(page),
             readComposerState(page).catch(() => ({ editorText: '', fallbackValue: '', activeValue: '' })),
@@ -216,6 +235,33 @@ export async function verifyPromptCommitted(page, prompt, options = {}) {
         message: 'Prompt did not appear in conversation before timeout (send may have failed)',
         mutationAllowed: true,
     });
+}
+
+/**
+ * Read the latest exact user-turn identity without allowing one stalled
+ * browser evaluation to consume the entire commit timeout.
+ *
+ * @param {Page} page
+ * @param {number} [timeoutMs]
+ * @returns {Promise<{ messageId: string|null, turnId: string|null }|null>}
+ */
+export async function readLatestCommittedUserTurn(page, timeoutMs = 2_000) {
+    let timer;
+    try {
+        const timeout = new Promise(resolve => {
+            timer = setTimeout(() => resolve(null), Math.max(1, Number(timeoutMs) || 2_000));
+        });
+        const result = await Promise.race([
+            page.evaluate(readLatestUserTurnIdentity, {}).catch(() => null),
+            timeout,
+        ]);
+        if (!result || typeof result !== 'object') return null;
+        const messageId = typeof result.messageId === 'string' && result.messageId ? result.messageId : null;
+        const turnId = typeof result.turnId === 'string' && result.turnId ? result.turnId : null;
+        return messageId || turnId ? { messageId, turnId } : null;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /**

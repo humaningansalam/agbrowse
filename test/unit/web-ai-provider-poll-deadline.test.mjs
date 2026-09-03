@@ -369,6 +369,26 @@ describe('expiredSessionTimeoutResult', () => {
         });
     });
 
+    it('returns durable completed evidence even after the polling deadline', () => {
+        const session = sessionWithDeadline(-5_000, 'helper-complete');
+        const completedAt = new Date().toISOString();
+        updateSession(session.sessionId, {
+            status: 'complete',
+            answer: 'finished answer',
+            completedAt,
+        });
+
+        expect(expiredSessionTimeoutResult(session.sessionId, 'chatgpt')).toMatchObject({
+            ok: true,
+            status: 'complete',
+            sessionId: session.sessionId,
+            generation: 1,
+            conversationUrl: 'https://chatgpt.com/c/helper-complete',
+            answerText: 'finished answer',
+            completedAt,
+        });
+    });
+
     it('judges expiry on a clock read AFTER the store lookup', async () => {
         // `getSession` takes the store lock, which retries and can block for
         // seconds. A clock sampled as a DEFAULT PARAMETER is read before that

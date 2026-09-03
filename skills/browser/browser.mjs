@@ -3646,7 +3646,8 @@ try {
         --session <id>                 Resolve the exact targetId persisted for
                                        a previous session
         --deadline <iso>               Override session deadline
-        --navigate                     Allow resume to switch tabs if needed
+        --navigate                     Recover only a proven-gone saved target;
+                                       live ChatGPT mismatches never navigate
          --new-tab                      Compatibility flag; new sessions always
                                         create a fresh provider tab
          --parallel                     Alias for --new-tab

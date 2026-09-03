@@ -31,7 +31,7 @@ describe('watcher transient-timeout store writes', () => {
         updateSession(created.sessionId, { status: 'timeout', warnings: [] });
         const holder = await holdStoreLock(1_000);
 
-        const losingWrite = restorePollingBeforeDeadline(created.sessionId, deadlineAt, {
+        const losingWrite = restorePollingBeforeDeadline(created.sessionId, 1, deadlineAt, {
             status: 'polling',
             warnings: ['watcher-transient-poll-timeout:30s'],
         });
@@ -49,7 +49,7 @@ describe('watcher transient-timeout store writes', () => {
         updateSession(created.sessionId, { status: 'timeout', warnings: [] });
         const holder = await holdStoreLock(100);
 
-        const write = restorePollingBeforeDeadline(created.sessionId, deadlineAt, {
+        const write = restorePollingBeforeDeadline(created.sessionId, 1, deadlineAt, {
             status: 'polling',
             warnings: ['watcher-transient-poll-timeout:30s'],
         });

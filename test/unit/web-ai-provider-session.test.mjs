@@ -338,14 +338,15 @@ describe('web-ai provider integration (source-string contracts)', () => {
     it('all three providers finalize completion and markSessionTimeout on timeout', () => {
         for (const src of [chatgptSrc, geminiSrc, grokSrc]) {
             expect(src).toMatch(/finalizeProviderTab\(deps, \{[\s\S]*?session[\s\S]*?answerText/);
-            // The awaited form is the contract now: the sync call took the
-            // blocking store lock inside the poll deadline.
-            expect(src).toMatch(/await\s+markSessionTimeoutAsync\(session\.sessionId/);
-            expect(src).not.toMatch(/[^cn]\bmarkSessionTimeout\(session\.sessionId/);
             expect(src).toContain("retryHint: 'poll-or-resume'");
             expect(src).toContain('recoverable: true');
         }
-        expect(finalizerSrc).toMatch(/updateSessionAsync\(session\.sessionId, \{[\s\S]*?status: 'complete'/);
+        for (const src of [geminiSrc, grokSrc]) {
+            expect(src).toMatch(/await\s+markSessionTimeoutAsync\(session\.sessionId/);
+            expect(src).not.toMatch(/[^cn]\bmarkSessionTimeout\(session\.sessionId/);
+        }
+        expect(chatgptSrc).toMatch(/await\s+markSessionTimeoutForGeneration\(session\.sessionId, expectedGeneration/);
+        expect(finalizerSrc).toMatch(/updateSessionForGeneration\(session\.sessionId, expectedGeneration, \{[\s\S]*?status: 'complete'/);
         expect(finalizerSrc).toMatch(/completedAt: new Date\(\)\.toISOString\(\)/);
     });
 
@@ -359,6 +360,7 @@ describe('web-ai provider integration (source-string contracts)', () => {
 
 describe('web-ai cli session flags', () => {
     const cliSrc = readFileSync(join(process.cwd(), 'web-ai/cli.mjs'), 'utf8');
+    const chatgptSrc = readFileSync(join(process.cwd(), 'web-ai/chatgpt.mjs'), 'utf8');
     it('declares --session, --deadline, --navigate options', () => {
         expect(cliSrc).toMatch(/session: \{ type: 'string' \}/);
         expect(cliSrc).toMatch(/deadline: \{ type: 'string' \}/);
@@ -386,20 +388,21 @@ describe('web-ai cli session flags', () => {
         expect(cliSrc).toContain('isRecoverableTabCrash');
         expect(cliSrc).toContain('target closed during session-bound web-ai command');
         expect(recoverySrc).toContain("session.conversationUrl || session.originalUrl || 'about:blank'");
-        expect(recoverySrc).toContain('(needsRecovery || forceRecover) && recoveryTargetUrl');
-        expect(recoverySrc).toContain('Fall through to a fresh tab recovery');
+        expect(recoverySrc).toContain('needsRecovery && recoveryTargetUrl');
+        expect(recoverySrc).toContain("liveness !== 'gone'");
+        expect(recoverySrc).not.toContain('forceRecover');
     });
 
-    it('keeps live post-submit conversation URLs instead of navigating back to provider root', () => {
-        const recoverySrc = readFileSync(join(process.cwd(), 'web-ai/tab-recovery.mjs'), 'utf8');
-        expect(recoverySrc).toContain('shouldPreferCurrentProviderUrl');
-        expect(recoverySrc).toContain("savedPath === '/' && currentPath !== '/'");
-        expect(recoverySrc).toContain('do not');
-        expect(recoverySrc).toContain('navigate it back to the stale root');
+    it('binds the post-submit durable conversation identity to the current generation', () => {
+        expect(chatgptSrc).toContain('waitForCommittedConversationUrl(page)');
+        expect(chatgptSrc).toContain('bindSessionConversation(');
+        expect(chatgptSrc).toContain('generation,');
     });
 
     it('wraps session-bound and provider web-ai mutations in active command ownership', () => {
-        expect(cliSrc).toContain("withActiveCommand } from './active-command-store.mjs'");
+        expect(cliSrc).toContain("from './active-command-store.mjs'");
+        expect(cliSrc).toContain('withActiveCommand,');
+        expect(cliSrc).toContain('registerActiveCommand,');
         expect(cliSrc).toMatch(/async function withWebAiActiveCommand\(command, deps, input, fn\)/);
         expect(cliSrc).toMatch(/command: `web-ai \$\{command\}`/);
         expect(cliSrc).toMatch(/owner: 'cli'/);
@@ -425,8 +428,12 @@ describe('web-ai cli session flags', () => {
     });
 
     it('creates a fresh target for every new session and never scans or checks out existing tabs', () => {
-        expect(cliSrc).toContain("import { createTab, waitForPageByTargetId }");
-        expect(cliSrc).toMatch(/createTab\(port, vendorUrl, \{ activate: false, reuseBlank: false \}\)/);
+        expect(cliSrc).toMatch(/import \{[\s\S]*?createTab,[\s\S]*?waitForPageByTargetId[\s\S]*?\} from '\.\.\/skills\/browser\/tab-manager\.mjs'/);
+        expect(cliSrc).toMatch(/createTab\(port, 'about:blank', \{/);
+        expect(cliSrc).toContain('activate: false');
+        expect(cliSrc).toContain('reuseBlank: false');
+        expect(cliSrc).toContain('onCreated: async (targetId) =>');
+        expect(cliSrc).toMatch(/page\.goto\(vendorUrl, \{ waitUntil: 'domcontentloaded', timeout: 30_000 \}\)/);
         expect(cliSrc).toMatch(/newTab: \['send', 'query', 'code'\]\.includes\(command\) && !values\.session/);
         expect(cliSrc).not.toContain('findReusableProviderTab');
         expect(cliSrc).not.toContain('getPooledTab');
@@ -456,10 +463,11 @@ describe('web-ai cli session flags', () => {
         expect(pollSection).not.toContain('withSessionCommandLock');
     });
 
-    it('repairs bound session pages that are alive but navigated to another conversation', () => {
+    it('refuses a live ChatGPT target that has navigated to another conversation', () => {
         const recoverySrc = readFileSync(join(process.cwd(), 'web-ai/tab-recovery.mjs'), 'utf8');
-        expect(recoverySrc).toMatch(/current\.conversationUrl && page\.url\(\) !== current\.conversationUrl/);
-        expect(recoverySrc).toMatch(/page\.goto\(current\.conversationUrl/);
+        expect(recoverySrc).toContain('expectedConversationId && actualConversationId !== expectedConversationId');
+        expect(recoverySrc).toContain('refusing hidden navigation');
+        expect(recoverySrc).not.toMatch(/current\.vendor === 'chatgpt'[\s\S]{0,500}page\.goto\(current\.conversationUrl/);
     });
 
     it('exports resolveSessionPage and gates doctor as a browser-required session subcommand', () => {

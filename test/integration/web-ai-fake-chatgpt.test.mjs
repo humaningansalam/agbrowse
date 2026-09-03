@@ -79,6 +79,45 @@ describe('web-ai fake ChatGPT fixture', () => {
         });
     });
 
+    it('keeps one logical session and advances generation for a later prompt', async () => {
+        const page = createFakeChatGptPage();
+        const deps = {
+            getPage: async () => page,
+            getTargetId: async () => 'target-fake',
+            getCdpSession: async () => ({
+                send: async (method, payload) => {
+                    if (method === 'Input.insertText') {
+                        page.insertedText = payload.text;
+                        page.composerValue = payload.text;
+                    }
+                    return {};
+                },
+                detach: async () => undefined,
+            }),
+        };
+        const first = await queryWebAi(deps, {
+            vendor: 'chatgpt', prompt: 'first', timeout: 2,
+        });
+        const second = await queryWebAi(deps, {
+            vendor: 'chatgpt', prompt: 'second', timeout: 2,
+            session: first.sessionId,
+        });
+
+        expect(second.sessionId).toBe(first.sessionId);
+        expect(second.generation).toBe(2);
+        expect(second.answerText).toBe('OK');
+        const rows = listSessions({ vendor: 'chatgpt' })
+            .filter((session) => session.sessionId === first.sessionId);
+        expect(rows).toHaveLength(1);
+        expect(getSession(first.sessionId)).toMatchObject({
+            generation: 2,
+            conversationId: 'fake',
+            conversationUrl: 'https://chatgpt.com/c/fake',
+            status: 'complete',
+            answer: 'OK',
+        });
+    });
+
     it('accepts turn-only identity with scoped controls', async () => {
         const page = createFakeChatGptPage({ identity: 'turn' });
         const result = await runFakeQuery(page);
@@ -187,7 +226,11 @@ function createFakeChatGptPage(options = {}) {
         insertedText: '',
         keys: [],
         assistantTexts: ['old answer'],
-        assistantTurns: [{ text: 'old answer', messageId: 'm0', turnId: 'conversation-turn-0', finished: true }],
+        userTurns: [{ messageId: 'u0', turnId: 'conversation-user-0', text: 'old question' }],
+        assistantTurns: [{
+            text: 'old answer', messageId: 'm0', turnId: 'conversation-turn-0', finished: true,
+            afterUserMessageId: 'u0', afterUserTurnId: 'conversation-user-0',
+        }],
         options,
         turnTexts: ['old answer'],
         clickedSend: false,
@@ -216,6 +259,40 @@ function createFakeChatGptPage(options = {}) {
             }
         },
         evaluate: async (_fn, arg, legacySendSelectors) => {
+            if (_fn?.name === 'readLatestUserTurnIdentity') {
+                const user = page.userTurns.at(-1);
+                return user ? { messageId: user.messageId, turnId: user.turnId } : null;
+            }
+            if (_fn?.name === 'readAssistantSnapshotSources') {
+                const submittedUser = page.userTurns.findLast(user =>
+                    (!arg?.submittedUserMessageId || user.messageId === arg.submittedUserMessageId)
+                    && (!arg?.submittedUserTurnId || user.turnId === arg.submittedUserTurnId));
+                let turns = submittedUser
+                    ? page.assistantTurns.filter(turn =>
+                        turn.afterUserMessageId === submittedUser.messageId
+                        || turn.afterUserTurnId === submittedUser.turnId)
+                    : [];
+                const responseAnchorExpected = Boolean(arg?.responseMessageId || arg?.responseTurnId);
+                const responseAnchorFound = responseAnchorExpected && page.assistantTurns.some(turn =>
+                    (!arg?.responseMessageId || turn.messageId === arg.responseMessageId)
+                    && (!arg?.responseTurnId || turn.turnId === arg.responseTurnId));
+                if (!submittedUser && responseAnchorFound) {
+                    turns = page.assistantTurns.filter(turn =>
+                        (!arg?.responseMessageId || turn.messageId === arg.responseMessageId)
+                        && (!arg?.responseTurnId || turn.turnId === arg.responseTurnId));
+                }
+                return {
+                    ok: true,
+                    userAnchorExpected: Boolean(arg?.submittedUserMessageId || arg?.submittedUserTurnId),
+                    userAnchorFound: Boolean(submittedUser),
+                    responseAnchorExpected,
+                    responseAnchorFound,
+                    wrapped: turns.map((turn, turnIndex) => ({
+                        ...turn, turnIndex, source: 'wrapped', domOrder: turnIndex,
+                    })),
+                    wrapperless: [],
+                };
+            }
             if (_fn?.name === 'readTopLevelAssistantSnapshots') {
                 if (options.failSnapshotEvaluate) throw new Error('snapshot evaluate failed');
                 return page.assistantTurns.map((turn, turnIndex) => ({ ...turn, turnIndex }));
@@ -312,6 +389,13 @@ function createFakeLocator(page, selector) {
 
 function commitPrompt(page) {
     page.clickedSend = true;
+    const userIndex = page.userTurns.length;
+    const userTurn = {
+        text: page.composerValue,
+        messageId: `u${userIndex}`,
+        turnId: `conversation-user-${userIndex}`,
+    };
+    page.userTurns.push(userTurn);
     page.turnTexts.push(page.composerValue);
     page.composerValue = '';
     page.assistantTexts.push('Pro thinking...');
@@ -319,6 +403,8 @@ function commitPrompt(page) {
         text: 'Pro thinking...',
         messageId: ['turn', 'none'].includes(page.options.identity) ? null : `m${page.assistantTurns.length}`,
         turnId: ['message', 'none'].includes(page.options.identity) ? null : `conversation-turn-${page.assistantTurns.length}`,
+        afterUserMessageId: userTurn.messageId,
+        afterUserTurnId: userTurn.turnId,
         finished: false,
     });
     page.turnTexts.push('Pro thinking...');

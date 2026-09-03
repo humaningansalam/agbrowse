@@ -17,6 +17,43 @@ export const CHATGPT_TURN_SELECTORS = [
     'section[data-testid^="conversation-turn"]',
 ];
 
+export const CHATGPT_USER_SELECTORS = [
+    '[data-message-author-role="user"]',
+    '[data-turn="user"]',
+];
+
+/**
+ * Browser-context helper. Capture the exact user turn created by the prompt
+ * that was just committed. At least one stable identity is required; a mounted
+ * node count is not an identity and cannot survive virtual-DOM churn.
+ *
+ * @param {{ userSelectors?: string[] }} [options]
+ * @returns {{ messageId: string|null, turnId: string|null }|null}
+ */
+export function readLatestUserTurnIdentity(options = {}) {
+    const selectors = Array.isArray(options.userSelectors) && options.userSelectors.length
+        ? options.userSelectors
+        : [
+            '[data-message-author-role="user"]',
+            '[data-turn="user"]',
+        ];
+    const FOLLOWING = document?.defaultView?.Node?.DOCUMENT_POSITION_FOLLOWING ?? 4;
+    const nodes = Array.from(new Set(selectors.flatMap(
+        selector => Array.from(document.querySelectorAll(selector)))));
+    nodes.sort((a, b) => (a.compareDocumentPosition(b) & FOLLOWING) ? -1 : 1);
+    const roleNode = nodes[nodes.length - 1] || null;
+    if (!roleNode) return null;
+    const turnNode = roleNode.closest?.('[data-testid^="conversation-turn"]')
+        || roleNode.querySelector?.('[data-testid^="conversation-turn"]')
+        || roleNode;
+    const messageNode = roleNode.matches?.('[data-message-id]')
+        ? roleNode
+        : roleNode.querySelector?.('[data-message-id]') || turnNode.querySelector?.('[data-message-id]');
+    const messageId = messageNode?.getAttribute?.('data-message-id') || null;
+    const turnId = turnNode?.getAttribute?.('data-testid') || null;
+    return messageId || turnId ? { messageId, turnId } : null;
+}
+
 /**
  * Browser-context helper. Reports whether the latest assistant turn follows the
  * latest user turn.
@@ -372,14 +409,23 @@ export function isActiveState(state) {
  * Declares every constant and helper in its own body: `page.evaluate` serializes
  * the body, not the module.
  *
- * @param {{ assistantSelectors: string[], resolverSource?: string, userSelectors?: string[], markdownSelectors?: string[] }} options
+ * @param {{ assistantSelectors: string[], resolverSource?: string, userSelectors?: string[], markdownSelectors?: string[], submittedUserMessageId?: string|null, submittedUserTurnId?: string|null, responseMessageId?: string|null, responseTurnId?: string|null }} options
  * `ok` distinguishes a SUCCESSFUL empty acquisition from a failure: a caller must
  * never fall back to a legacy reader after a successful empty read, or it will
  * count whatever that reader happens to find.
  *
  * @returns {{ ok: true, wrapped: ChatGptCorrelatedSnapshot[], wrapperless: ChatGptCorrelatedSnapshot[] }}
  */
-export function readAssistantSnapshotSources({ assistantSelectors, resolverSource, userSelectors, markdownSelectors }) {
+export function readAssistantSnapshotSources({
+    assistantSelectors,
+    resolverSource,
+    userSelectors,
+    markdownSelectors,
+    submittedUserMessageId,
+    submittedUserTurnId,
+    responseMessageId,
+    responseTurnId,
+}) {
     const USER_SELECTORS = (userSelectors && userSelectors.length) ? userSelectors : [
         '[data-message-author-role="user"]',
         '[data-turn="user"]',
@@ -426,14 +472,54 @@ export function readAssistantSnapshotSources({ assistantSelectors, resolverSourc
 
     const userNodes = orderNodes(USER_SELECTORS.flatMap(
         (selector) => Array.from(document.querySelectorAll(selector))));
-    const latestUser = userNodes[userNodes.length - 1] || null;
+    const userIdentity = (/** @type {any} */ node) => {
+        const turnNode = node.closest?.('[data-testid^="conversation-turn"]')
+            || node.querySelector?.('[data-testid^="conversation-turn"]')
+            || node;
+        const messageNode = node.matches?.('[data-message-id]')
+            ? node
+            : node.querySelector?.('[data-message-id]') || turnNode.querySelector?.('[data-message-id]');
+        return {
+            messageId: messageNode?.getAttribute?.('data-message-id') || null,
+            turnId: turnNode?.getAttribute?.('data-testid') || null,
+        };
+    };
+    const userAnchorExpected = Boolean(submittedUserMessageId || submittedUserTurnId);
+    const submittedUser = userAnchorExpected
+        ? userNodes.findLast(node => {
+            const identity = userIdentity(node);
+            return (!submittedUserMessageId || identity.messageId === submittedUserMessageId)
+                && (!submittedUserTurnId || identity.turnId === submittedUserTurnId);
+        }) || null
+        : userNodes[userNodes.length - 1] || null;
+
+    const responseAnchorExpected = Boolean(responseMessageId || responseTurnId);
+    const responseMatches = (/** @type {any} */ node) => {
+        const identity = describe(node);
+        return (!responseMessageId || identity.messageId === responseMessageId)
+            && (!responseTurnId || identity.turnId === responseTurnId);
+    };
+    const responseAnchorFound = responseAnchorExpected && wrappedNodes.some(responseMatches);
+
+    // Primary correlation is causal: assistant DOM after the exact submitted
+    // user turn. If that user node has since been virtualized, a previously
+    // learned exact response identity remains sufficient. Otherwise fail closed
+    // to no wrapped candidates instead of re-admitting historical answers.
+    if (submittedUser) {
+        wrappedNodes = wrappedNodes.filter(node =>
+            (submittedUser.compareDocumentPosition(node) & FOLLOWING) !== 0);
+    } else if (responseAnchorFound) {
+        wrappedNodes = wrappedNodes.filter(responseMatches);
+    } else if (userAnchorExpected) {
+        wrappedNodes = [];
+    }
 
     const wrapperlessNodes = orderNodes(MARKDOWN_SELECTORS.flatMap(
         (selector) => Array.from(document.querySelectorAll(selector))))
         .filter((node) => isVisible(node))
         .filter((node) => !node.closest?.(WRAPPER_SELECTORS.join(', ')))
-        .filter((node) => Boolean(latestUser)
-            && (latestUser.compareDocumentPosition(node) & FOLLOWING) !== 0)
+        .filter((node) => Boolean(submittedUser)
+            && (submittedUser.compareDocumentPosition(node) & FOLLOWING) !== 0)
         .filter((node) => textOf(node));
 
     const order = new Map(orderNodes([...wrappedNodes, ...wrapperlessNodes])
@@ -441,6 +527,10 @@ export function readAssistantSnapshotSources({ assistantSelectors, resolverSourc
 
     return {
         ok: true,
+        userAnchorExpected,
+        userAnchorFound: Boolean(submittedUser),
+        responseAnchorExpected,
+        responseAnchorFound,
         wrapped: wrappedNodes.map((/** @type {any} */ node, /** @type {number} */ turnIndex) => ({
             ...describe(node), turnIndex, source: 'wrapped', domOrder: order.get(node) ?? turnIndex,
         })),

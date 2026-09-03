@@ -35,3 +35,15 @@ export function extractDurableConversationId(candidate) {
 export function isDurableConversationUrl(candidate) {
     return extractDurableConversationId(candidate) !== null;
 }
+
+/**
+ * Canonical ChatGPT conversation URL. Host aliases, query strings, fragments,
+ * trailing slashes and GPT-prefix paths collapse to the same durable identity.
+ *
+ * @param {string|null|undefined} candidate
+ * @returns {string|null}
+ */
+export function canonicalChatGptConversationUrl(candidate) {
+    const conversationId = extractDurableConversationId(candidate);
+    return conversationId ? `https://chatgpt.com/c/${conversationId}` : null;
+}

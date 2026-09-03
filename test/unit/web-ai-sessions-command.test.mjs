@@ -68,10 +68,11 @@ describe('web-ai sessions CLI surface (source-string contracts)', () => {
         expect(sessionsSrc).toContain('withSessionCommandLock');
     });
 
-    it('reattach respects --navigate when conversationUrl differs', () => {
+    it('reattach never tells callers to navigate a live identity mismatch', () => {
         expect(sessionsSrc).toMatch(/input\.navigate === true/);
         expect(sessionsSrc).toMatch(/reattach-mismatch/);
-        expect(sessionsSrc).toMatch(/pass --navigate to switch tabs/);
+        expect(sessionsSrc).toMatch(/live target identity mismatch/);
+        expect(sessionsSrc).not.toMatch(/pass --navigate to switch tabs/);
     });
 
     it('prune defaults --older-than to 30d when omitted', () => {

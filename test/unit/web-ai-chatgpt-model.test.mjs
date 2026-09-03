@@ -872,7 +872,8 @@ describe('web-ai ChatGPT model selector policy', () => {
         expect(cliSrc).toContain("family: { type: 'string' }");
         expect(cliSrc).toContain('family: values.family');
         expect(chatgptSrc).toContain('family: input.family');
-        expect(chatgptSrc).toContain('updateSession(session.sessionId, { modelSelection: selectedModel.modelSelection });');
+        expect(chatgptSrc).toContain('updateSessionForGeneration(session.sessionId, generation, {');
+        expect(chatgptSrc).toContain('modelSelection: selectedModel.modelSelection');
         expect(chatgptSrc).toContain('...(selectedModel?.warnings || [])');
     });
 });

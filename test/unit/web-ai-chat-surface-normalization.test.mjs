@@ -254,6 +254,9 @@ describe('normalizeSurface warning reaches the caller (G16)', () => {
     function makeCompletedSendPage(initialSurface) {
         const surfaceClicks = [];
         let surface = initialSurface;
+        let currentUrl = 'https://chatgpt.com/';
+        let latestUserIdentity = null;
+        let userTurnIndex = 0;
         const page = {
             composerValue: '',
             insertedText: '',
@@ -262,22 +265,31 @@ describe('normalizeSurface warning reaches the caller (G16)', () => {
             assistantTexts: ['old answer'],
             surfaceClicks,
             get surface() { return surface; },
-            url: () => 'https://chatgpt.com/',
+            url: () => currentUrl,
             innerText: async (selector) => (selector === 'body' ? page.assistantTexts.join('\n') : ''),
             waitForTimeout: async () => undefined,
             keyboard: {
                 insertText: async (text) => { page.insertedText = text; page.composerValue = text; },
                 press: async (key) => { page.keys.push(key); if (key === 'Enter') commit(); },
             },
-            evaluate: async () => null,
+            evaluate: async (fn) => {
+                if (fn?.name === 'readLatestUserTurnIdentity') return latestUserIdentity;
+                return null;
+            },
             locator: (selector) => makeLocator(selector),
         };
 
         function commit() {
+            userTurnIndex += 1;
+            latestUserIdentity = {
+                messageId: `surface-user-${userTurnIndex}`,
+                turnId: `conversation-turn-user-${userTurnIndex}`,
+            };
             page.turnTexts.push(page.composerValue);
             page.composerValue = '';
             page.turnTexts.push('Pro thinking...');
             page.assistantTexts.push('Pro thinking...');
+            currentUrl = 'https://chatgpt.com/c/surface-complete';
         }
 
         function radio(label) {

@@ -4,6 +4,7 @@
  * @typedef {any} Input
  * @typedef {any} Page
  */
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -12,10 +13,16 @@ import { pollWebAi } from './chatgpt.mjs';
 import { isWorkSession, pollWorkSession } from './chatgpt-work-picker.mjs';
 import { geminiPollWebAi } from './gemini-live.mjs';
 import { grokPollWebAi } from './grok-live.mjs';
-import { DEADLINE_PASSED, getSession, resolvePollTimeoutSec, updateSession, updateSessionAsync } from './session.mjs';
+import {
+    DEADLINE_PASSED,
+    GENERATION_CHANGED,
+    getSession,
+    resolvePollTimeoutSec,
+    sessionGeneration,
+    updateSessionForGeneration,
+} from './session.mjs';
 import { isRecoverableCdpDisconnect, probeCdpLiveness } from './cdp-liveness.mjs';
 import { isCdpDisconnectError, reattachSessionPage, storedDeadlineStillActive, withSessionPage, withSessionPageGuarded, urlsCompatible } from './tab-recovery.mjs';
-import { withSessionCommandLock } from './session-store.mjs';
 import { WebAiError, wrapError } from './errors.mjs';
 import {
     defineCapability, runCapabilities,
@@ -58,6 +65,17 @@ export async function watchSession(deps, input = {}, notifier = null) {
         });
     }
 
+    const startingSession = getSession(options.sessionId);
+    if (!startingSession) {
+        throw new WebAiError({
+            errorCode: 'watcher.session-missing',
+            stage: 'watcher-load-session',
+            retryHint: 'sessions-list',
+            message: `no session record for ${options.sessionId}`,
+            evidence: { sessionId: options.sessionId },
+        });
+    }
+    const generation = sessionGeneration(startingSession);
     const lock = acquireWatcherSessionLock(options.sessionId, { staleMs: options.lockStaleMs });
     const notify = notifier || createStdoutNotifier({ json: options.json });
     /** @type {any[]} */
@@ -71,13 +89,32 @@ export async function watchSession(deps, input = {}, notifier = null) {
     let final = null;
     try {
         if (options.hasExplicitDeadlineOverride && options.deadlineAt) {
-            updateSession(options.sessionId, { deadlineAt: options.deadlineAt });
+            const deadlineWrite = await updateSessionForGeneration(
+                options.sessionId,
+                generation,
+                { deadlineAt: options.deadlineAt },
+            );
+            if (deadlineWrite === GENERATION_CHANGED) {
+                return {
+                    ok: false,
+                    status: 'superseded',
+                    sessionId: options.sessionId,
+                    generation,
+                    final: supersededWatchTick(startingSession, startingSession.vendor || 'chatgpt', generation),
+                    eventsPrinted: true,
+                    events: options.captureEvents ? /** @type {any} */ (events) : undefined,
+                };
+            }
         }
         await emit({ type: 'watch.start', status: 'watching', intervalMs: options.intervalMs, pollTimeoutSec: options.pollTimeoutSec });
 
         for (let iteration = 1; ; iteration += 1) {
             lock.heartbeat({ iteration });
-            const tick = await watchSessionOnce(deps, { ...options, session: options.sessionId });
+            const tick = await watchSessionOnce(deps, {
+                ...options,
+                session: options.sessionId,
+                generation,
+            });
             final = tick;
             await emit({
                 type: 'watch.tick',
@@ -89,7 +126,7 @@ export async function watchSession(deps, input = {}, notifier = null) {
                 warnings: tick.warnings || [],
             });
 
-            if (tick.terminal === true) {
+            if (tick.terminal === true || tick.status === 'superseded') {
                 await emit({ type: `watch.${tick.status}`, status: tick.status, terminal: true, vendor: tick.vendor });
                 break;
             }
@@ -115,9 +152,11 @@ export async function watchSession(deps, input = {}, notifier = null) {
         return {
             // Not unconditionally true: a fail-closed tick has to reach the
             // caller as a failure.
-            ok: final?.errorCode !== 'provider.file-artifact',
+            ok: final?.errorCode !== 'provider.file-artifact'
+                && final?.errorCode !== 'session.generation-superseded',
             status: final?.status || 'watch-complete',
             sessionId: options.sessionId,
+            generation,
             final,
             eventsPrinted: true,
             events: options.captureEvents ? /** @type {any} */ (events) : undefined,
@@ -145,6 +184,12 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         });
     }
     const vendor = session.vendor || options.vendor || 'chatgpt';
+    const generation = Number.isInteger(Number(input.generation)) && Number(input.generation) > 0
+        ? Number(input.generation)
+        : sessionGeneration(session);
+    if (sessionGeneration(session) !== generation) {
+        return supersededWatchTick(session, vendor, generation);
+    }
     if (options.vendor && session.vendor && options.vendor !== session.vendor) {
         throw new WebAiError({
             errorCode: 'watcher.vendor-mismatch',
@@ -157,42 +202,35 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
     }
 
     if (session.status === 'timeout' && !isDeadlineExpired(session.deadlineAt)) {
-        // Promote a transient (pre-deadline) timeout back to polling under the
-        // session command lock so a concurrent live `poll --session` cannot
-        // clobber the status mid-flip.
-        await withSessionCommandLock(session.sessionId, async () => {
-            const refreshed = getSession(session.sessionId) || session;
-            if (refreshed.status === 'timeout' && !isDeadlineExpired(refreshed.deadlineAt)) {
-                const restored = await restorePollingBeforeDeadline(session.sessionId, refreshed.deadlineAt, {
-                    status: 'polling',
-                    warnings: appendUniqueWarning(refreshed.warnings || [], 'watcher-resumed-transient-timeout'),
-                });
-                session.status = restored === DEADLINE_PASSED ? refreshed.status : (restored?.status || refreshed.status);
-            } else {
-                session.status = refreshed.status;
-            }
-        }, { ttlMs: 30_000, heartbeatMs: 0 });
+        const restored = await restorePollingBeforeDeadline(
+            session.sessionId,
+            generation,
+            session.deadlineAt,
+            {
+                status: 'polling',
+                warnings: appendUniqueWarning(session.warnings || [], 'watcher-resumed-transient-timeout'),
+            },
+        );
+        if (restored === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
+        if (restored !== DEADLINE_PASSED) session.status = restored?.status || session.status;
     }
     if (TERMINAL_SESSION_STATUSES.has(session.status)) {
-        if (session.status === 'complete') {
-            const downgraded = await downgradeCompleteIfStillStreaming(deps, session, vendor);
-            if (downgraded) return downgraded;
-        }
         return {
             ok: true, sessionId: session.sessionId, vendor,
-            status: session.status, terminal: true,
+            status: session.status, terminal: true, generation,
             answerText: session.answer || null,
             warnings: session.warnings || [],
         };
     }
     if (isDeadlineExpired(session.deadlineAt)) {
-        updateSession(session.sessionId, {
+        const expired = await updateSessionForGeneration(session.sessionId, generation, {
             status: 'timeout',
             lastError: { errorCode: 'provider.poll-timeout', message: 'watcher deadline reached' },
         });
+        if (expired === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
         return {
             ok: true, sessionId: session.sessionId, vendor,
-            status: 'timeout', terminal: true,
+            status: 'timeout', terminal: true, generation,
             warnings: ['deadline-reached'],
         };
     }
@@ -208,6 +246,9 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         // The recovery inside the resolver performs binding writes; under a
         // stored deadline those writes are refused post-lock once it passes.
         const result = await withSessionPageGuarded(deps, options.sessionId, async ({ page, targetId, session: resolvedSession }) => {
+        if (sessionGeneration(resolvedSession || session) !== generation) {
+            return supersededWatchTick(session, vendor, generation);
+        }
         const profileLockSummary = await readProfileLockSummary()
             .catch(err => ({ state: 'unknown', error: err?.message || String(err) }));
         const reattach = await ensureWatcherAttached(page, resolvedSession || session, options);
@@ -222,7 +263,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
 
         const preflight = await runWatcherPreflight(page, vendor);
         if (preflight.worst === 'fail') {
-            updateSession(session.sessionId, {
+            const failed = await updateSessionForGeneration(session.sessionId, generation, {
                 status: 'polling',
                 lastError: {
                     errorCode: 'capability.unsupported',
@@ -230,6 +271,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
                     evidence: preflight.rows,
                 },
             });
+            if (failed === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
             return {
                 ok: false, sessionId: session.sessionId, vendor,
                 status: 'capability-fail', terminal: false,
@@ -255,7 +297,13 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         };
 
         const domHashBefore = await domHashAround(/** @type {any} */ (page), ['body'], { maxChars: options.domHashMaxChars }).catch(() => null);
-        const pollResult = await pollVendor(sessionDeps, vendor, resolvedSession || session, options);
+        const pollResult = await pollVendor(sessionDeps, vendor, resolvedSession || session, {
+            ...options,
+            generation,
+        });
+        if (pollResult?.errorCode === 'session.generation-superseded' || pollResult?.status === 'superseded') {
+            return supersededWatchTick(session, vendor, generation);
+        }
         if (pollResult?.status === 'tab-crashed' && isCdpDisconnectError(pollResult.error)) {
             consumedDisconnect = { error: pollResult.error, pollResult };
             return pollResult;
@@ -265,46 +313,38 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             ? (/** @type {any} */ (pollResult)).answerText
             : (typeof (/** @type {any} */ (pollResult)).answer === 'string' ? (/** @type {any} */ (pollResult)).answer : null);
         const refreshed = getSession(session.sessionId) || session;
+        if (sessionGeneration(refreshed) !== generation) {
+            return supersededWatchTick(session, vendor, generation);
+        }
         let status = refreshed.status || pollResult.status || 'polling';
         /** @type {string[]} */
         const watcherWarnings = [];
 
         if (status === 'timeout' && !isDeadlineExpired(refreshed.deadlineAt || session.deadlineAt)) {
             const deadlineAtValue = refreshed.deadlineAt || session.deadlineAt;
-            const restored = await restorePollingBeforeDeadline(session.sessionId, deadlineAtValue, {
+            const restored = await restorePollingBeforeDeadline(session.sessionId, generation, deadlineAtValue, {
                 status: 'polling',
                 warnings: appendUniqueWarning(
                     refreshed.warnings || [],
                     `watcher-transient-poll-timeout:${options.pollTimeoutSec}s`,
                 ),
             });
+            if (restored === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
             if (restored !== DEADLINE_PASSED) status = restored?.status || status;
         }
-        if (status === 'complete' && await hasStreamingIndicator(page, vendor)) {
-            const latest = getSession(session.sessionId) || refreshed;
-            const warning = 'watcher-complete-deferred-streaming';
-            watcherWarnings.push(warning);
-            updateSession(session.sessionId, {
-                status: 'polling',
-                answer: null,
-                completedAt: null,
-                lastStreamingState: 'streaming',
-                warnings: appendUniqueWarning(latest.warnings || [], warning),
-            });
-            status = 'polling';
-        }
-
-        updateSession(session.sessionId, {
+        const observed = await updateSessionForGeneration(session.sessionId, generation, {
             lastDomHash: domHashAfter || domHashBefore || refreshed.lastDomHash || null,
             lastStreamingState: deriveStreamingState(status, pollResult),
             lastResponseCharCount: answerText ? answerText.length : (refreshed.lastResponseCharCount || 0),
         });
+        if (observed === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
 
         return {
             ok: pollResult.ok !== false,
             sessionId: session.sessionId,
             vendor,
             status,
+            generation,
             terminal: TERMINAL_SESSION_STATUSES.has(status),
             url: (/** @type {any} */ (page)).url?.() || null,
             answerText,
@@ -325,12 +365,13 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         if (!consumedDisconnect) return result;
     } catch (err) {
         if (!isCdpDisconnectError(err)) throw err;
-        return recoverCdpDisconnect(deps, options, vendor, err, null, recoveryDeps);
+        return recoverCdpDisconnect(deps, options, vendor, generation, err, null, recoveryDeps);
     }
     return recoverCdpDisconnect(
         deps,
         options,
         vendor,
+        generation,
         consumedDisconnect.error,
         consumedDisconnect.pollResult,
         recoveryDeps,
@@ -343,13 +384,17 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
  * @param {any} deps
  * @param {any} options
  * @param {string} vendor
+ * @param {number} generation
  * @param {unknown} disconnect
  * @param {any} consumedResult
  * @param {{ probeCdpLiveness?: typeof probeCdpLiveness, reattachSessionPage?: typeof reattachSessionPage, callVendorPoll?: typeof callVendorPoll }} recoveryDeps
  */
-async function recoverCdpDisconnect(deps, options, vendor, disconnect, consumedResult, recoveryDeps) {
+async function recoverCdpDisconnect(deps, options, vendor, generation, disconnect, consumedResult, recoveryDeps) {
     const preserved = getSession(options.sessionId);
     if (!preserved) throw disconnect;
+    if (sessionGeneration(preserved) !== generation) {
+        return supersededWatchTick(preserved, vendor, generation);
+    }
     const fingerprint = cdpDisconnectFingerprint(preserved.targetId, disconnect);
     if (preserved.cdpRecovery?.fingerprint === fingerprint) {
         return consumedResult || {
@@ -360,12 +405,17 @@ async function recoverCdpDisconnect(deps, options, vendor, disconnect, consumedR
     }
 
     const attemptedAt = new Date().toISOString();
-    updateSession(preserved.sessionId, { cdpRecovery: { fingerprint, attemptedAt } });
+    const attempted = await updateSessionForGeneration(
+        preserved.sessionId,
+        generation,
+        { cdpRecovery: { fingerprint, attemptedAt } },
+    );
+    if (attempted === GENERATION_CHANGED) return supersededWatchTick(preserved, vendor, generation);
     const probe = recoveryDeps.probeCdpLiveness || probeCdpLiveness;
     const liveness = await probe({ port: deps.getPort(), targetId: preserved.targetId });
     const recoverable = isRecoverableCdpDisconnect(liveness);
     const warning = recoverable ? 'watcher-cdp-reattach-once' : 'watcher-cdp-recovery-skipped';
-    updateSession(preserved.sessionId, {
+    const recorded = await updateSessionForGeneration(preserved.sessionId, generation, {
         status: recoverable ? 'polling' : preserved.status,
         lastError: {
             errorCode: 'watcher.cdp-disconnected',
@@ -376,6 +426,7 @@ async function recoverCdpDisconnect(deps, options, vendor, disconnect, consumedR
         },
         warnings: appendUniqueWarning(preserved.warnings || [], warning),
     });
+    if (recorded === GENERATION_CHANGED) return supersededWatchTick(preserved, vendor, generation);
     if (!recoverable) {
         if (consumedResult) return { ...consumedResult, warnings: mergeWarnings(consumedResult.warnings || [], [warning]) };
         throw disconnect;
@@ -384,6 +435,9 @@ async function recoverCdpDisconnect(deps, options, vendor, disconnect, consumedR
     const reattach = recoveryDeps.reattachSessionPage || reattachSessionPage;
     const resolved = await reattach(deps, preserved.sessionId);
     const checkpoint = getSession(preserved.sessionId) || preserved;
+    if (sessionGeneration(checkpoint) !== generation) {
+        return supersededWatchTick(checkpoint, vendor, generation);
+    }
     if (hasFinalizedSession(checkpoint)) {
         return {
             ok: true, sessionId: checkpoint.sessionId, vendor,
@@ -406,8 +460,14 @@ async function recoverCdpDisconnect(deps, options, vendor, disconnect, consumedR
         },
     };
     const pollVendor = recoveryDeps.callVendorPoll || callVendorPoll;
-    const pollResult = await pollVendor(sessionDeps, vendor, checkpoint, options);
+    const pollResult = await pollVendor(sessionDeps, vendor, checkpoint, { ...options, generation });
+    if (pollResult?.errorCode === 'session.generation-superseded' || pollResult?.status === 'superseded') {
+        return supersededWatchTick(checkpoint, vendor, generation);
+    }
     const refreshed = getSession(checkpoint.sessionId) || checkpoint;
+    if (sessionGeneration(refreshed) !== generation) {
+        return supersededWatchTick(refreshed, vendor, generation);
+    }
     const status = refreshed.status || pollResult.status || 'polling';
     const answerText = typeof pollResult.answerText === 'string'
         ? pollResult.answerText
@@ -417,6 +477,7 @@ async function recoverCdpDisconnect(deps, options, vendor, disconnect, consumedR
         sessionId: checkpoint.sessionId,
         vendor,
         status,
+        generation,
         terminal: TERMINAL_SESSION_STATUSES.has(status),
         url: resolved.page?.url?.() || null,
         answerText,
@@ -506,24 +567,33 @@ export function normalizeWatchOptions(input = {}) {
  */
 export function acquireWatcherSessionLock(sessionId, { staleMs = DEFAULT_WATCH_LOCK_STALE_MS } = {}) {
     const dir = watcherLockPath(sessionId);
+    const ownerToken = randomBytes(16).toString('hex');
     mkdirSync(watcherHome(), { recursive: true });
     for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
             mkdirSync(dir);
             writeWatcherLockMetadata(dir, {
-                sessionId, pid: process.pid,
+                sessionId, pid: process.pid, ownerToken,
                 startedAt: new Date().toISOString(),
                 heartbeatAt: new Date().toISOString(),
             });
             return {
                 lockPath: dir,
                 heartbeat(extra = {}) {
+                    const current = readWatcherLockMetadata(dir);
+                    if (current?.ownerToken !== ownerToken) return false;
                     writeWatcherLockMetadata(dir, {
-                        sessionId, pid: process.pid,
+                        sessionId, pid: process.pid, ownerToken,
                         heartbeatAt: new Date().toISOString(), ...extra,
                     });
+                    return true;
                 },
-                release() { rmSync(dir, { recursive: true, force: true }); },
+                release() {
+                    const current = readWatcherLockMetadata(dir);
+                    if (current?.ownerToken === ownerToken) {
+                        rmSync(dir, { recursive: true, force: true });
+                    }
+                },
             };
         } catch (err) {
             if ((/** @type {any} */ (err))?.code !== 'EEXIST') throw err;
@@ -600,39 +670,6 @@ export async function hasStreamingIndicator(page, vendor) {
 // --- internal helpers ---
 
 /**
- * @param {any} deps
- * @param {any} session
- * @param {string} vendor
- */
-async function downgradeCompleteIfStillStreaming(deps, session, vendor) {
-    try {
-        return await withSessionPage(deps, session.sessionId, async ({ page }) => {
-            if (!await hasStreamingIndicator(page, vendor)) return null;
-            const warning = 'watcher-complete-deferred-streaming';
-            updateSession(session.sessionId, {
-                status: 'polling',
-                answer: null,
-                completedAt: null,
-                lastStreamingState: 'streaming',
-                warnings: appendUniqueWarning(session.warnings || [], warning),
-            });
-            return {
-                ok: true,
-                sessionId: session.sessionId,
-                vendor,
-                status: 'polling',
-                terminal: false,
-                url: (/** @type {any} */ (page)).url?.() || null,
-                answerText: typeof session.answer === 'string' ? session.answer : null,
-                warnings: appendUniqueWarning(session.warnings || [], warning),
-            };
-        });
-    } catch {
-        return null;
-    }
-}
-
-/**
  * @param {any} page
  * @param {any} session
  * @param {any} options
@@ -644,8 +681,16 @@ async function ensureWatcherAttached(page, session, options) {
     // Use the canonical tolerant predicate (shared with resolveSessionPage) instead
     // of a stricter hash-only compare: same-conversation root->/c/ drift and trailing
     // slashes are compatible, while a genuinely different conversation or a
-    // non-provider landing still mismatches and (with --navigate) re-navigates.
+    // non-provider landing still mismatches. Only non-ChatGPT providers retain
+    // the explicit --navigate compatibility path below.
     if (urlsCompatible(targetUrl, currentUrl)) return { ok: true, url: currentUrl, warnings: [] };
+    if (session.vendor === 'chatgpt') {
+        return {
+            ok: false,
+            url: currentUrl,
+            warnings: [`current ChatGPT target ${currentUrl} does not match session conversation ${targetUrl}; refusing hidden navigation`],
+        };
+    }
     if (options.navigate) {
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: options.navigateTimeoutMs });
         // G9: Verify conversation readiness after navigation (Oracle 83c3ca2).
@@ -681,6 +726,7 @@ async function callVendorPoll(deps, vendor, session, options) {
         return await pollFn(deps, {
             vendor,
             session: session.sessionId,
+            generation: Number(options.generation || sessionGeneration(session)),
             // Clamped to the stored deadline, and fractional. This is a PER-POLL
             // slice — 30s by default — and passing it straight through let a
             // session with 400ms left poll for another 30 seconds, because the
@@ -698,10 +744,14 @@ async function callVendorPoll(deps, vendor, session, options) {
     } catch (rawErr) {
         const err = wrapError(rawErr);
         if (err.errorCode === 'provider.poll-timeout' && !isDeadlineExpired(session.deadlineAt)) {
-            const restored = await restorePollingBeforeDeadline(session.sessionId, session.deadlineAt, {
+            const generation = Number(options.generation || sessionGeneration(session));
+            const restored = await restorePollingBeforeDeadline(session.sessionId, generation, session.deadlineAt, {
                 status: 'polling',
                 lastError: err.toJSON ? err.toJSON() : { errorCode: err.errorCode, message: err.message },
             });
+            if (restored === GENERATION_CHANGED) {
+                return supersededWatchTick(session, vendor, generation);
+            }
             if (restored !== DEADLINE_PASSED) {
                 return { ok: true, status: 'polling', warnings: [`transient-poll-timeout:${options.pollTimeoutSec}s`] };
             }
@@ -715,15 +765,38 @@ async function callVendorPoll(deps, vendor, session, options) {
  * Restore a transient timeout only while the stored absolute deadline is live.
  * The predicate is re-checked after the store lock is acquired.
  * @param {string} sessionId
+ * @param {number} generation
  * @param {string|null|undefined} deadlineAtValue
  * @param {Record<string, unknown>} patch
  */
-export function restorePollingBeforeDeadline(sessionId, deadlineAtValue, patch) {
-    return updateSessionAsync(
+export function restorePollingBeforeDeadline(sessionId, generation, deadlineAtValue, patch) {
+    return updateSessionForGeneration(
         sessionId,
+        generation,
         patch,
         () => Date.now() < Date.parse(/** @type {string} */ (deadlineAtValue)),
     );
+}
+
+/**
+ * @param {any} session
+ * @param {string} vendor
+ * @param {number} generation
+ */
+function supersededWatchTick(session, vendor, generation) {
+    return {
+        ok: false,
+        sessionId: session.sessionId,
+        vendor,
+        status: 'superseded',
+        terminal: true,
+        generation,
+        currentGeneration: sessionGeneration(getSession(session.sessionId) || session),
+        answerText: null,
+        warnings: ['session-generation-superseded'],
+        errorCode: 'session.generation-superseded',
+        retryHint: 'use-latest-generation',
+    };
 }
 
 /**
@@ -838,9 +911,11 @@ function readWatcherLockMetadata(dir) {
  */
 function isWatcherLockStale(metadata, staleMs) {
     if (!metadata) return true;
-    if (!pidAlive(Number(metadata.pid))) return true;
-    const heartbeat = Date.parse(metadata.heartbeatAt || metadata.startedAt || '');
-    return Number.isFinite(heartbeat) && Date.now() - heartbeat > staleMs;
+    // A watcher owned by a live local process is not stealable. Forced exit or
+    // kill makes the PID probe fail immediately, so the next watcher can
+    // reclaim the directory without waiting for a TTL and without an ABA race
+    // from the former owner heartbeat/release.
+    return !pidAlive(Number(metadata.pid));
 }
 
 /**

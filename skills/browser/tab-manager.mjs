@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
  * @typedef {{ active: true, previousTargetId: string|undefined, currentTargetId: string, lastActiveAt: number|null }} SwitchTabResult
  * @typedef {{ targetId: string, url: string, title: string, type: string, attached?: boolean, lastActiveAt: number|null }} ManagedTabRow
  * @typedef {{ targetId: string, url: string, title: string, type: string }} TabInfo
- * @typedef {{ activate?: boolean, reuseBlank?: boolean }} TabOpts
+ * @typedef {{ activate?: boolean, reuseBlank?: boolean, onCreated?: (targetId: string) => void|Promise<void> }} TabOpts
  */
 
 /** @type {Map<number, CdpConnectionEntry>} */
@@ -253,6 +253,11 @@ export async function createTab(port, url = 'about:blank', opts = {}) {
 
         const created = /** @type {{ targetId: string }} */ (await createTargetWithWindowFallback(cdp, url, opts));
         const { targetId } = created;
+
+        // Let callers publish cross-process ownership before this fresh target
+        // is observable as an otherwise-untracked tab. Cleanup running in a
+        // different agent must not be able to close it during page attachment.
+        await opts.onCreated?.(targetId);
 
         await new Promise(r => setTimeout(r, 100));
 

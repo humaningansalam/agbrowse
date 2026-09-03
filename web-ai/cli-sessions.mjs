@@ -10,8 +10,8 @@ import { grokPollWebAi } from './grok-live.mjs';
 import { isWorkSession, pollWorkSession } from './chatgpt-work-picker.mjs';
 import { resumeDeepResearch } from './chatgpt-deep-research.mjs';
 import { WebAiError } from './errors.mjs';
-import { getSession, listSessions, pruneSessionsOlderThan, updateSession, resolvePollTimeoutSec, resolveTimeoutBudgetSec, expiredSessionTimeoutResult } from './session.mjs';
-import { resolveSessionPage, storedDeadlineStillActive, withSessionPage, withSessionPageGuarded, openConversationInNewTab } from './tab-recovery.mjs';
+import { getSession, listSessions, pruneSessionsOlderThan, resolvePollTimeoutSec, resolveTimeoutBudgetSec, expiredSessionTimeoutResult } from './session.mjs';
+import { resolveSessionPage, storedDeadlineStillActive, withSessionPage, withSessionPageGuarded } from './tab-recovery.mjs';
 import { withSessionCommandLock } from './session-store.mjs';
 import { buildSessionDoctorReport } from './session-doctor.mjs';
 
@@ -187,33 +187,10 @@ export async function runSessionsCommand(args, values, deps, input) {
             };
         }
         if (resolved.mismatch) {
-            // 35.1 new-tab recovery: when navigation is authorized, open the saved
-            // ChatGPT conversation in a fresh tab (32.3-guarded) instead of failing.
-            if (input.navigate === true && session.vendor === 'chatgpt') {
-                const reopened = await openConversationInNewTab(deps, { conversationUrl: session.conversationUrl });
-                if (reopened.opened) {
-                    updateSession(id, { targetId: reopened.targetId });
-                    return {
-                        ok: true,
-                        status: 'reattached',
-                        sessionId: id,
-                        targetId: reopened.targetId,
-                        url: /** @type {any} */ (reopened.page).url?.() || reopened.conversationUrl,
-                        recovered: true,
-                        strategy: 'new-tab',
-                        warnings: ['recovered-via-new-tab'],
-                    };
-                }
-                return {
-                    ok: false,
-                    status: 'reattach-mismatch',
-                    sessionId: id,
-                    targetId: resolved.targetId,
-                    url: resolved.url,
-                    conversationUrl: resolved.conversationUrl,
-                    warnings: [...(resolved.warnings || []), `new-tab-recovery-failed:${reopened.reason}`],
-                };
-            }
+            // `resolveSessionPage` already performs the only allowed recovery:
+            // a positively gone target reopened at its exact saved conversation.
+            // Any remaining mismatch is a live/unknown identity conflict and
+            // must not be converted into another target by this command.
             return {
                 ok: false,
                 status: 'reattach-mismatch',
@@ -303,7 +280,7 @@ export function printSessionsHuman(result) {
     }
     if (result.status === 'reattach-mismatch') {
         console.log(`reattach mismatch: tab=${result.url} session=${result.conversationUrl}`);
-        console.log('pass --navigate to switch tabs');
+        console.log('live target identity mismatch; use the correct session or close the wrong tab explicitly');
         return;
     }
     if (result.status === 'session-doctor') {

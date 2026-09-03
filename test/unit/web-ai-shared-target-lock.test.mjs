@@ -26,19 +26,24 @@ afterEach(() => {
 
 describe('web-ai shared target lock guard', () => {
     it('creates a distinct target for every new send without consulting the active tab', async () => {
+        const makePage = () => {
+            let url = 'about:blank';
+            return {
+                url: vi.fn(() => url),
+                goto: vi.fn(async next => { url = next; }),
+                context: vi.fn(() => ({ newCDPSession: vi.fn(async () => ({})) })),
+            };
+        };
         const pages = new Map([
-            ['target-a', {
-                url: vi.fn(() => 'https://chatgpt.com/'),
-                context: vi.fn(() => ({ newCDPSession: vi.fn(async () => ({})) })),
-            }],
-            ['target-b', {
-                url: vi.fn(() => 'https://chatgpt.com/'),
-                context: vi.fn(() => ({ newCDPSession: vi.fn(async () => ({})) })),
-            }],
+            ['target-a', makePage()],
+            ['target-b', makePage()],
         ]);
-        const createTab = vi.fn()
-            .mockResolvedValueOnce({ targetId: 'target-a' })
-            .mockResolvedValueOnce({ targetId: 'target-b' });
+        const targetIds = ['target-a', 'target-b'];
+        const createTab = vi.fn(async (_port, _url, options = {}) => {
+            const targetId = targetIds.shift();
+            await options.onCreated?.(targetId);
+            return { targetId };
+        });
         const waitForPageByTargetId = vi.fn(async (_port, targetId) => pages.get(targetId));
         const cleanupIdleTabs = vi.fn(async () => ({ closed: [] }));
         const sendWebAi = vi.fn(async deps => {
@@ -91,13 +96,21 @@ describe('web-ai shared target lock guard', () => {
 
             expect(first).toMatchObject({ sessionId: 'session-target-a', targetId: 'target-a' });
             expect(second).toMatchObject({ sessionId: 'session-target-b', targetId: 'target-b' });
-            expect(createTab).toHaveBeenNthCalledWith(1, 9222, 'https://chatgpt.com', {
+            expect(createTab).toHaveBeenNthCalledWith(1, 9222, 'about:blank', expect.objectContaining({
                 activate: false,
                 reuseBlank: false,
+                onCreated: expect.any(Function),
+            }));
+            expect(createTab).toHaveBeenNthCalledWith(2, 9222, 'about:blank', expect.objectContaining({
+                activate: false,
+                reuseBlank: false,
+                onCreated: expect.any(Function),
+            }));
+            expect(pages.get('target-a').goto).toHaveBeenCalledWith('https://chatgpt.com', {
+                waitUntil: 'domcontentloaded', timeout: 30_000,
             });
-            expect(createTab).toHaveBeenNthCalledWith(2, 9222, 'https://chatgpt.com', {
-                activate: false,
-                reuseBlank: false,
+            expect(pages.get('target-b').goto).toHaveBeenCalledWith('https://chatgpt.com', {
+                waitUntil: 'domcontentloaded', timeout: 30_000,
             });
             expect(waitForPageByTargetId).toHaveBeenNthCalledWith(1, 9222, 'target-a');
             expect(waitForPageByTargetId).toHaveBeenNthCalledWith(2, 9222, 'target-b');
@@ -339,13 +352,14 @@ describe('web-ai shared target lock guard', () => {
                 getBrowserStatus: async () => ({ running: true }),
                 readBrowserState: () => ({ headless: false }),
             })).rejects.toMatchObject({
-                errorCode: 'cdp.target-mismatch',
+                errorCode: 'session.conversation-mismatch',
                 stage: 'target-resolution',
                 evidence: {
                     expectedTargetId: 'target-drift',
                     actualTargetId: 'target-drift',
                     port: 9222,
-                    recovery: `agbrowse web-ai stop --vendor chatgpt --session ${session.sessionId} --navigate --json`,
+                    expectedConversationId: 'expected',
+                    actualConversationId: 'live',
                     targetMismatch: {
                         expectedTargetId: 'target-drift',
                         actualTargetId: 'target-drift',

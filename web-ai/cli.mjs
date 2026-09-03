@@ -25,11 +25,19 @@ import { watchSession } from './watcher.mjs';
 import { buildWebAiSnapshot } from './ax-snapshot.mjs';
 import { runSessionsCommand, printSessionsHuman, parseDurationToMs } from './cli-sessions.mjs';
 import { isChatGptEffortSupported, normalizeChatGptEffortChoice, normalizeChatGptFamilyChoice } from './chatgpt-model.mjs';
-import { createTab, waitForPageByTargetId } from '../skills/browser/tab-manager.mjs';
+import { closeTab, createTab, waitForPageByTargetId } from '../skills/browser/tab-manager.mjs';
 import { cleanupIdleTabs, DEFAULT_MAX_TABS } from '../skills/browser/tab-lifecycle.mjs';
 import { resolveSessionPage, withSessionPage } from './tab-recovery.mjs';
 import { withSessionCommandLock } from './session-store.mjs';
-import { getSession, resolvePollTimeoutSec, resolveTimeoutDefaultSec, expiredSessionTimeoutResult } from './session.mjs';
+import {
+    getSession,
+    resolvePollTimeoutSec,
+    resolveTimeoutDefaultSec,
+    expiredSessionTimeoutResult,
+    sessionConversationId,
+    sessionGeneration,
+} from './session.mjs';
+import { extractDurableConversationId } from './conversation-url.mjs';
 import { finalizeProviderTab } from './tab-finalizer.mjs';
 import { runMcpServer } from './mcp-server.mjs';
 import { runWebAiEval } from './eval-runner.mjs';
@@ -38,7 +46,12 @@ import { writeCommandTrace } from './trace/writer.mjs';
 import { enforcePolicy } from './policy/enforce.mjs';
 import { loadPolicy } from './policy/schema.mjs';
 import { applyProviderDefaults } from './policy/default-policy.mjs';
-import { withActiveCommand } from './active-command-store.mjs';
+import {
+    heartbeatActiveCommand,
+    registerActiveCommand,
+    releaseActiveCommand,
+    withActiveCommand,
+} from './active-command-store.mjs';
 import { auditSources } from './source-audit.mjs';
 export { parseDurationToMs };
 
@@ -227,8 +240,9 @@ Sessions (durable across shells, stored at $BROWSER_AGENT_HOME/web-ai-sessions.j
                       inspect the browser's active tab.
   --deadline <iso>    Override the session deadline (default now + --timeout
                       or the vendor polling default).
-  --navigate          When sessions reattach finds a tab mismatch, allow
-                      the runtime to switch tabs to the saved conversationUrl.
+  --navigate          Allow saved-URL recovery only after the stored target is
+                      proven gone. A live ChatGPT conversation mismatch never
+                      navigates or rebinds the session.
   --new-tab           Compatibility flag; new sessions always get a fresh tab
   --parallel          Alias for --new-tab
 
@@ -1218,10 +1232,41 @@ async function ensureProviderTab(deps, input) {
 
     // One new logical session owns one fresh CDP target. Do not inspect or
     // borrow any existing provider tab; active-tab state is irrelevant.
-    const tab = await createTab(port, vendorUrl, { activate: false, reuseBlank: false });
-    const page = await waitForPageByTargetId(port, tab.targetId);
+    let reservation = null;
+    let heartbeatTimer = null;
+    const tab = await createTab(port, 'about:blank', {
+        activate: false,
+        reuseBlank: false,
+        onCreated: async (targetId) => {
+            reservation = await registerActiveCommand({
+                command: 'web-ai target-create',
+                provider: input.vendor || 'chatgpt',
+                sessionId: null,
+                targetId,
+                owner: 'cli',
+                port,
+                ttlMs: 120_000,
+            });
+            heartbeatTimer = setInterval(() => {
+                void heartbeatActiveCommand(reservation.commandId, { ttlMs: 120_000 }).catch(() => undefined);
+            }, 15_000);
+            heartbeatTimer.unref?.();
+        },
+    });
+    let page;
+    try {
+        page = await waitForPageByTargetId(port, tab.targetId);
+        await page.goto(vendorUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    } catch (error) {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        if (reservation?.commandId) await releaseActiveCommand(reservation.commandId, 'failed').catch(() => undefined);
+        await closeTab(port, tab.targetId).catch(() => undefined);
+        throw error;
+    }
     return {
         ...deps,
+        targetReservation: reservation,
+        targetReservationHeartbeat: heartbeatTimer,
         getPage: async () => {
             if (page.isClosed?.()) throw new Error(`bound tab closed: ${tab.targetId}`);
             return page;
@@ -1265,6 +1310,7 @@ async function runBoundCommand(command, deps, input, pollFn, stopFn) {
                     ...input,
                     vendor: session.vendor,
                     session: session.sessionId,
+                    generation: sessionGeneration(session),
                     // Bounded like every other resume surface. Forwarding the
                     // raw input meant an omitted timeout fell through to a
                     // provider default — 1200s for Gemini, 600s for Grok —
@@ -1345,14 +1391,21 @@ function sessionResolutionError(command, deps, input, resolved) {
     const expectedTargetId = resolved.session?.targetId || resolved.targetId || null;
     const actualTargetId = resolved.url ? (resolved.targetId || null) : null;
     const port = Number(deps.getPort?.() || process.env.CDP_PORT || 9222);
-    const recovery = sessionId
-        ? `agbrowse web-ai ${command || 'poll'} --vendor ${vendor} --session ${sessionId} --navigate --json`
-        : `agbrowse web-ai ${command || 'poll'} --vendor ${vendor} --navigate --json`;
+    const expectedConversationId = sessionConversationId(resolved.session);
+    const actualConversationId = extractDurableConversationId(resolved.url);
+    const conversationMismatch = Boolean(
+        expectedConversationId && actualConversationId !== expectedConversationId,
+    );
+    const recovery = conversationMismatch
+        ? null
+        : sessionId
+            ? `agbrowse web-ai ${command || 'poll'} --vendor ${vendor} --session ${sessionId} --navigate --json`
+            : `agbrowse web-ai ${command || 'poll'} --vendor ${vendor} --navigate --json`;
     return new WebAiError({
-        errorCode: 'cdp.target-mismatch',
+        errorCode: conversationMismatch ? 'session.conversation-mismatch' : 'cdp.target-mismatch',
         stage: 'target-resolution',
         vendor,
-        retryHint: 'pass-session-or-navigate',
+        retryHint: conversationMismatch ? 'use-correct-session' : 'pass-session-or-navigate',
         message: resolved.warnings?.[0] || `session ${sessionId} is not attached to its saved provider tab`,
         mutationAllowed: false,
         evidence: {
@@ -1363,12 +1416,14 @@ function sessionResolutionError(command, deps, input, resolved) {
             port,
             url: resolved.url || null,
             conversationUrl: resolved.conversationUrl || null,
+            expectedConversationId,
+            actualConversationId,
             targetMismatch: {
                 expectedTargetId,
                 actualTargetId,
                 port,
             },
-            recovery,
+            ...(recovery ? { recovery } : {}),
             warnings: resolved.warnings || [],
         },
     });
@@ -1429,6 +1484,15 @@ async function runBoundSendOrQuery(command, deps, input) {
 async function withWebAiActiveCommand(command, deps, input, fn) {
     const targetId = await deps.getTargetId?.().catch(() => null);
     if (!targetId) return fn();
+    if (deps.targetReservation?.targetId === targetId) {
+        try {
+            await deps.prepareProviderPage?.();
+            return await fn();
+        } finally {
+            if (deps.targetReservationHeartbeat) clearInterval(deps.targetReservationHeartbeat);
+            await releaseActiveCommand(deps.targetReservation.commandId).catch(() => undefined);
+        }
+    }
     return withActiveCommand({
         command: `web-ai ${command}`,
         provider: input.vendor || 'chatgpt',
@@ -1581,6 +1645,7 @@ async function runStatusCommand(deps, input, statusFn) {
         ...result,
         sessionId: resolved.session.sessionId,
         targetId: resolved.targetId,
+        generation: sessionGeneration(resolved.session),
     };
 }
 
@@ -1857,6 +1922,7 @@ async function runSnapshotCommand(deps, input, values) {
         sessionId: resolved.session.sessionId,
         targetId: resolved.targetId,
         vendor: resolved.session.vendor,
+        generation: sessionGeneration(resolved.session),
     };
 }
 

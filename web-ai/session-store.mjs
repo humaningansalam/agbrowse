@@ -1,6 +1,15 @@
 // @ts-check
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+    existsSync,
+    mkdirSync,
+    openSync,
+    closeSync,
+    readFileSync,
+    renameSync,
+    unlinkSync,
+    writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -11,12 +20,18 @@ import { homedir } from 'node:os';
  *   createdAt: string,
  *   updatedAt: string,
  *   deadlineAt: string|null,
+ *   generation?: number,
  *   targetId: string|null,
  *   tabId: string|null,
  *   tabState?: { createdAt?: string, lastActiveAt?: string, recoveryCount?: number, closeCount?: number, [extra: string]: unknown },
  *   cdpRecovery?: { fingerprint: string, attemptedAt: string }|null,
  *   originalUrl: string|null,
  *   conversationUrl: string|null,
+ *   conversationId?: string|null,
+ *   submittedUserMessageId?: string|null,
+ *   submittedUserTurnId?: string|null,
+ *   responseMessageId?: string|null,
+ *   responseTurnId?: string|null,
  *   promptHash: string,
  *   envelopeSummary?: Record<string, unknown>,
  *   status: string,
@@ -41,7 +56,7 @@ import { homedir } from 'node:os';
  * }} WebAiSessionStore
  */
 
-export const SESSION_STORE_VERSION = 1;
+export const SESSION_STORE_VERSION = 3;
 
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const LOCK_RETRY_MS = 25;
@@ -104,6 +119,38 @@ function encodeRandom() {
 // failed rather than genuinely missed.
 let lastReadCorrupt = false;
 
+/**
+ * In-memory migration for rows written before logical prompt generations and
+ * durable conversation identity became part of the session contract.
+ *
+ * @param {WebAiSession} session
+ * @returns {WebAiSession}
+ */
+function normalizeStoredSession(session) {
+    if (!session || typeof session !== 'object') return session;
+    return {
+        ...session,
+        generation: Number.isInteger(session.generation) && session.generation > 0
+            ? session.generation
+            : 1,
+        conversationId: typeof session.conversationId === 'string' && session.conversationId
+            ? session.conversationId
+            : null,
+        submittedUserMessageId: typeof session.submittedUserMessageId === 'string' && session.submittedUserMessageId
+            ? session.submittedUserMessageId
+            : null,
+        submittedUserTurnId: typeof session.submittedUserTurnId === 'string' && session.submittedUserTurnId
+            ? session.submittedUserTurnId
+            : null,
+        responseMessageId: typeof session.responseMessageId === 'string' && session.responseMessageId
+            ? session.responseMessageId
+            : null,
+        responseTurnId: typeof session.responseTurnId === 'string' && session.responseTurnId
+            ? session.responseTurnId
+            : null,
+    };
+}
+
 /** @returns {WebAiSessionStore} */
 export function readSessionStore() {
     const path = storePath();
@@ -123,10 +170,11 @@ export function readSessionStore() {
         if (!Array.isArray(parsed.sessions)) {
             lastReadCorrupt = parsed.sessions !== undefined && parsed.sessions !== null;
             parsed.sessions = [];
-            if (typeof parsed.version !== 'number') parsed.version = SESSION_STORE_VERSION;
+            parsed.version = SESSION_STORE_VERSION;
             return parsed;
         }
-        if (typeof parsed.version !== 'number') parsed.version = SESSION_STORE_VERSION;
+        parsed.version = SESSION_STORE_VERSION;
+        parsed.sessions = parsed.sessions.map(normalizeStoredSession);
         lastReadCorrupt = false;
         return parsed;
     } catch {
@@ -175,7 +223,7 @@ export function writeSessionStore(store) {
     const path = storePath();
     mkdirSync(dirname(path), { recursive: true });
     const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
-    writeFileSync(tmp, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
+    writeFileSync(tmp, `${JSON.stringify({ ...store, version: SESSION_STORE_VERSION }, null, 2)}\n`, 'utf8');
     renameSync(tmp, path);
 }
 
@@ -186,19 +234,27 @@ export function writeSessionStore(store) {
  */
 export function withStoreLock(fn) {
     const path = lockPath();
+    const ownerToken = randomBytes(16).toString('hex');
     mkdirSync(dirname(path), { recursive: true });
     let attempts = 0;
     while (attempts < LOCK_RETRY_LIMIT) {
         try {
             const fd = openSync(path, 'wx');
             try {
-                writeFileSync(fd, JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }));
+                writeFileSync(fd, JSON.stringify({
+                    pid: process.pid,
+                    ownerToken,
+                    acquiredAt: new Date().toISOString(),
+                }));
             } catch { /* best-effort metadata write */ }
             try {
                 return fn();
             } finally {
+                const current = readLockFile(path);
                 try { closeSync(fd); } catch { /* already closed */ }
-                try { unlinkSync(path); } catch { /* already gone */ }
+                if (current?.ownerToken === ownerToken) {
+                    try { unlinkSync(path); } catch { /* already gone */ }
+                }
             }
         } catch (err) {
             const e = /** @type {NodeJS.ErrnoException} */ (err);
@@ -234,6 +290,7 @@ export function withStoreLock(fn) {
  */
 export async function withStoreLockAsync(fn) {
     const path = lockPath();
+    const ownerToken = randomBytes(16).toString('hex');
     mkdirSync(dirname(path), { recursive: true });
     let attempts = 0;
     while (attempts < LOCK_RETRY_LIMIT) {
@@ -254,13 +311,20 @@ export async function withStoreLockAsync(fn) {
         // Acquired. The release is in `finally` so an awaited `fn` that throws
         // still frees the lock for the next holder.
         try {
-            writeFileSync(fd, JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }));
+            writeFileSync(fd, JSON.stringify({
+                pid: process.pid,
+                ownerToken,
+                acquiredAt: new Date().toISOString(),
+            }));
         } catch { /* best-effort metadata write */ }
         try {
             return await fn();
         } finally {
+            const current = readLockFile(path);
             try { closeSync(fd); } catch { /* already closed */ }
-            try { unlinkSync(path); } catch { /* already gone */ }
+            if (current?.ownerToken === ownerToken) {
+                try { unlinkSync(path); } catch { /* already gone */ }
+            }
         }
     }
     throw new Error(`web-ai session store: failed to acquire lock at ${path} after ${LOCK_RETRY_LIMIT} attempts`);
@@ -274,6 +338,8 @@ function isStoreLockStale(path) {
     try {
         const raw = readFileSync(path, 'utf8');
         const parsed = JSON.parse(raw);
+        const pid = Number(parsed?.pid);
+        if (Number.isFinite(pid) && pid > 0 && !pidAlive(pid)) return true;
         const acquired = Date.parse(parsed?.acquiredAt || '');
         if (!Number.isFinite(acquired)) return true;
         return Date.now() - acquired > STORE_LOCK_STALE_MS;
@@ -287,11 +353,12 @@ function isStoreLockStale(path) {
  * @param {number} ttlMs
  * @param {number} [acquiredAtMs]
  */
-function commandLockMetadata(sessionId, ttlMs, acquiredAtMs = Date.now()) {
+function commandLockMetadata(sessionId, ttlMs, acquiredAtMs = Date.now(), ownerToken = null) {
     const ttl = Number(ttlMs || DEFAULT_SESSION_COMMAND_LOCK_TTL_MS);
     const now = Date.now();
     return {
         pid: process.pid,
+        ownerToken,
         sessionId,
         acquiredAt: new Date(acquiredAtMs).toISOString(),
         heartbeatAt: new Date(now).toISOString(),
@@ -330,11 +397,19 @@ function pidAlive(pid) {
 function isSessionCommandLockStale(path) {
     const lock = readLockFile(path);
     if (!lock || lock.corrupt) return true;
-    if (!pidAlive(Number(lock.pid))) return true;
+    const ownerPid = Number(lock.pid);
+    // New locks always record the local owner PID. A live process remains the
+    // owner regardless of wall-clock TTL; Ctrl+C/kill makes this probe fail and
+    // the next command reclaims the lock immediately. This removes the
+    // live-owner stale-takeover/late-heartbeat ABA race rather than trying to
+    // patch it with a second global coordinator.
+    if (Number.isFinite(ownerPid) && ownerPid > 0) return !pidAlive(ownerPid);
+    // Legacy rows without a PID retain the old TTL fallback.
     const heartbeat = Date.parse(lock.heartbeatAt || lock.acquiredAt || '');
     const expires = Date.parse(lock.expiresAt || '');
     if (Number.isFinite(expires)) return expires <= Date.now();
-    return Number.isFinite(heartbeat) && Date.now() - heartbeat > DEFAULT_SESSION_COMMAND_LOCK_TTL_MS;
+    return Number.isFinite(heartbeat)
+        && Date.now() - heartbeat > DEFAULT_SESSION_COMMAND_LOCK_TTL_MS;
 }
 
 /**
@@ -394,12 +469,14 @@ export async function withSessionCommandLock(sessionId, fn, options = {}) {
     let attempts = 0;
     const ttlMs = Number(options.ttlMs || DEFAULT_SESSION_COMMAND_LOCK_TTL_MS);
     const heartbeatMs = Number(options.heartbeatMs ?? SESSION_COMMAND_LOCK_HEARTBEAT_MS);
-    const acquiredAtMs = Date.now();
+    const ownerToken = randomBytes(16).toString('hex');
+    let acquiredAtMs = Date.now();
     while (attempts < LOCK_RETRY_LIMIT) {
         try {
             fd = openSync(path, 'wx');
+            acquiredAtMs = Date.now();
             try {
-                writeFileSync(fd, JSON.stringify(commandLockMetadata(sessionId, ttlMs, acquiredAtMs)));
+                writeFileSync(fd, JSON.stringify(commandLockMetadata(sessionId, ttlMs, acquiredAtMs, ownerToken)));
             } catch { /* best-effort metadata write */ }
             break;
         } catch (err) {
@@ -424,7 +501,12 @@ export async function withSessionCommandLock(sessionId, fn, options = {}) {
     }
     const heartbeatTimer = heartbeatMs > 0
         ? setInterval(() => {
-            try { writeFileSync(path, JSON.stringify(commandLockMetadata(sessionId, ttlMs, acquiredAtMs))); } catch { /* best effort */ }
+            try {
+                const current = readLockFile(path);
+                if (current?.ownerToken === ownerToken) {
+                    writeFileSync(path, JSON.stringify(commandLockMetadata(sessionId, ttlMs, acquiredAtMs, ownerToken)));
+                }
+            } catch { /* best effort */ }
         }, Math.max(1000, heartbeatMs))
         : null;
     heartbeatTimer?.unref?.();
@@ -432,8 +514,11 @@ export async function withSessionCommandLock(sessionId, fn, options = {}) {
         return await fn();
     } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
+        const current = readLockFile(path);
         try { closeSync(fd); } catch { /* already closed */ }
-        try { unlinkSync(path); } catch { /* already gone */ }
+        if (current?.ownerToken === ownerToken) {
+            try { unlinkSync(path); } catch { /* already gone */ }
+        }
     }
 }
 
@@ -452,7 +537,7 @@ export function insertSession(session) {
 
 /**
  * @param {string} sessionId
- * @param {Partial<WebAiSession> & Record<string, unknown>} patch
+ * @param {(Partial<WebAiSession> & Record<string, unknown>)|((current: WebAiSession) => (Partial<WebAiSession> & Record<string, unknown>)|null)} patch
  * @returns {WebAiSession|null}
  */
 export function patchSession(sessionId, patch) {
@@ -460,7 +545,10 @@ export function patchSession(sessionId, patch) {
         const store = readSessionStore();
         const idx = store.sessions.findIndex((s) => s.sessionId === sessionId);
         if (idx < 0) return null;
-        store.sessions[idx] = { ...store.sessions[idx], ...patch };
+        const current = normalizeStoredSession(store.sessions[idx]);
+        const effectivePatch = typeof patch === 'function' ? patch(current) : patch;
+        if (!effectivePatch) return current;
+        store.sessions[idx] = normalizeStoredSession({ ...current, ...effectivePatch });
         writeSessionStore(store);
         return store.sessions[idx];
     });
@@ -574,9 +662,10 @@ export function mutateSessionAsync(sessionId, mutate, stillActive) {
         const store = readSessionStore();
         const idx = store.sessions.findIndex((s) => s.sessionId === sessionId);
         if (idx < 0) return null;
-        const patch = mutate(store.sessions[idx]);
-        if (!patch) return store.sessions[idx];
-        store.sessions[idx] = { ...store.sessions[idx], ...patch };
+        const current = normalizeStoredSession(store.sessions[idx]);
+        const patch = mutate(current);
+        if (!patch) return current;
+        store.sessions[idx] = normalizeStoredSession({ ...current, ...patch });
         writeSessionStore(store);
         return store.sessions[idx];
     });

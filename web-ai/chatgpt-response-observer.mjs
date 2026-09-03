@@ -13,6 +13,7 @@
 import {
     CHATGPT_ASSISTANT_SELECTORS,
     CHATGPT_STOP_SELECTORS,
+    readAssistantSnapshotSources,
     readTopLevelAssistantSnapshots,
     resolveTopLevelAssistantTurns,
 } from './chatgpt-response-dom.mjs';
@@ -92,12 +93,42 @@ export async function observeAssistantResponse(page, { baselineAssistantCount = 
  * rejecting placeholders via the injected `isFinalAnswer` predicate. Read-only;
  * never throws. Returns `null` when there is no usable final answer.
  * @param {{ evaluate: Function, waitForTimeout?: Function, locator?: Function }} page
- * @param {{ baselineAssistantCount?: number, isFinalAnswer?: (text: string) => boolean, readStreaming?: () => Promise<boolean>|boolean, readFinished?: (sample: import('./chatgpt-response-dom.mjs').ChatGptAssistantSnapshot) => Promise<boolean>|boolean }} [opts]
+ * @param {{ baselineAssistantCount?: number, submittedUserMessageId?: string|null, submittedUserTurnId?: string|null, responseMessageId?: string|null, responseTurnId?: string|null, isFinalAnswer?: (text: string) => boolean, readStreaming?: () => Promise<boolean>|boolean, readFinished?: (sample: import('./chatgpt-response-dom.mjs').ChatGptAssistantSnapshot) => Promise<boolean>|boolean }} [opts]
  * @returns {Promise<{ from: 'recovery', text: string, sample: import('./chatgpt-response-dom.mjs').ChatGptAssistantSnapshot, recovered: true, streaming: boolean, finished: boolean, responseStableMs: number } | null>}
  */
-export async function recoverAssistantResponse(page, { baselineAssistantCount = 0, isFinalAnswer, readStreaming, readFinished } = {}) {
+export async function recoverAssistantResponse(page, {
+    baselineAssistantCount = 0,
+    submittedUserMessageId = null,
+    submittedUserTurnId = null,
+    responseMessageId = null,
+    responseTurnId = null,
+    isFinalAnswer,
+    readStreaming,
+    readFinished,
+} = {}) {
     const minIdx = Math.max(0, Math.floor(Number(baselineAssistantCount) || 0));
+    const hasTurnAnchor = Boolean(submittedUserMessageId || submittedUserTurnId);
     const readCandidates = async () => {
+        if (hasTurnAnchor) {
+            try {
+                const correlated = await page.evaluate(readAssistantSnapshotSources, {
+                    assistantSelectors: CHATGPT_ASSISTANT_SELECTORS,
+                    resolverSource: resolveTopLevelAssistantTurns.toString(),
+                    submittedUserMessageId,
+                    submittedUserTurnId,
+                    responseMessageId,
+                    responseTurnId,
+                });
+                if (!correlated?.ok || !Array.isArray(correlated.wrapped) || !Array.isArray(correlated.wrapperless)) return [];
+                if (!correlated.userAnchorFound && !correlated.responseAnchorFound) return [];
+                return [...correlated.wrapped, ...correlated.wrapperless]
+                    .sort((a, b) => (a.domOrder ?? 0) - (b.domOrder ?? 0))
+                    .filter(sample => sample?.text)
+                    .filter(sample => typeof isFinalAnswer === 'function' ? isFinalAnswer(sample.text) : true);
+            } catch {
+                return [];
+            }
+        }
         let snapshots;
         try {
             snapshots = await page.evaluate(readTopLevelAssistantSnapshots, CHATGPT_ASSISTANT_SELECTORS).catch(() => []);

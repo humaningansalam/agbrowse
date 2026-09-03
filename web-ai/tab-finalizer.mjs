@@ -1,5 +1,11 @@
 // @ts-check
-import { updateSessionAsync, DEADLINE_PASSED } from './session.mjs';
+import {
+    DEADLINE_PASSED,
+    GENERATION_CHANGED,
+    isSessionGenerationCurrent,
+    sessionGeneration,
+    updateSessionForGeneration,
+} from './session.mjs';
 import { poolTab } from './tab-pool.mjs';
 import { trySaveTranscript, appendArtifactRecordAsync } from './session-artifacts.mjs';
 import { resolveArchivePolicy, archiveConversation } from './chatgpt-archive.mjs';
@@ -30,6 +36,7 @@ const FINALIZABLE_STATUSES = new Set(['complete', 'completed']);
  * @property {string} [vendor]
  * @property {FinalizeSession} [session]
  * @property {FinalizePage} [page]
+ * @property {number} [generation]
  * @property {string} [answerText]
  * @property {string} [artifactText]
  * @property {string} [status]
@@ -52,6 +59,7 @@ export async function finalizeProviderTab(deps, {
     vendor,
     session,
     page,
+    generation,
     answerText,
     artifactText,
     status = 'complete',
@@ -70,12 +78,21 @@ export async function finalizeProviderTab(deps, {
     // entry check alone let a losing run write the answer, persist a transcript
     // and click Archive after its caller was already handed `timeout`.
     const expired = () => stillActive?.() === false;
+    const expectedGeneration = Number(generation || sessionGeneration(/** @type {any} */ (session)));
+    const stillOwned = async () => !expired()
+        && await isSessionGenerationCurrent(/** @type {string} */ (session.sessionId), expectedGeneration);
     if (expired()) {
         return { finalized: false, reason: 'poll-deadline-exceeded' };
     }
+    if (!await stillOwned()) {
+        return {
+            finalized: false,
+            reason: expired() ? 'poll-deadline-exceeded' : 'generation-superseded',
+        };
+    }
     const conversationUrl = page?.url?.() || session.conversationUrl || session.originalUrl || undefined;
     const baseWarnings = Array.isArray(warnings) ? warnings : [];
-    const completed = await updateSessionAsync(session.sessionId, {
+    const completed = await updateSessionForGeneration(session.sessionId, expectedGeneration, {
         status: 'complete',
         conversationUrl,
         answer: answerText,
@@ -85,11 +102,14 @@ export async function finalizeProviderTab(deps, {
     if (completed === DEADLINE_PASSED) {
         return { finalized: false, reason: 'poll-deadline-exceeded' };
     }
+    if (completed === GENERATION_CHANGED) {
+        return { finalized: false, reason: 'generation-superseded' };
+    }
     /** @type {{ required: boolean, ok: boolean, descriptor?: unknown, stage?: string, error?: string }} */
     let artifactStatus = { required: false, ok: true };
     // The store lock sits between the write above and here. Re-checked so a
     // transcript file is not created for a run that lost while it waited.
-    if (answerText && !expired()) {
+    if (answerText && await stillOwned()) {
         const saved = trySaveTranscript(session.sessionId, artifactText || answerText);
         artifactStatus = saved.ok
             ? { required: true, ok: true, descriptor: saved.descriptor }
@@ -97,26 +117,37 @@ export async function finalizeProviderTab(deps, {
         // Re-checked AFTER the save. Writing the transcript touches the
         // filesystem, so the deadline can pass inside it; both branches below
         // are session writes and must not start once it has.
-        if (expired()) {
-            return { finalized: true, pool: null, archiveSkippedReason: 'poll-deadline-exceeded' };
+        if (!await stillOwned()) {
+            return { finalized: true, pool: null, archiveSkippedReason: expired() ? 'poll-deadline-exceeded' : 'generation-superseded' };
         }
         if (saved.ok) {
-            const appended = await appendArtifactRecordAsync(session.sessionId, saved.descriptor, () => !expired());
+            const appended = await appendArtifactRecordAsync(
+                session.sessionId,
+                saved.descriptor,
+                () => !expired(),
+                expectedGeneration,
+            );
             if (appended === DEADLINE_PASSED) {
                 return { finalized: true, pool: null, archiveSkippedReason: 'poll-deadline-exceeded' };
             }
+            if (appended === GENERATION_CHANGED) {
+                return { finalized: true, pool: null, archiveSkippedReason: 'generation-superseded' };
+            }
         } else {
-            const warned = await updateSessionAsync(session.sessionId, {
+            const warned = await updateSessionForGeneration(session.sessionId, expectedGeneration, {
                 warnings: [...baseWarnings, `artifact-save-failed:${saved.stage}:${saved.error}`],
             }, () => !expired());
             if (warned === DEADLINE_PASSED) {
                 return { finalized: true, pool: null, archiveSkippedReason: 'poll-deadline-exceeded' };
             }
+            if (warned === GENERATION_CHANGED) {
+                return { finalized: true, pool: null, archiveSkippedReason: 'generation-superseded' };
+            }
         }
     }
 
-    if (expired()) {
-        return { finalized: true, pool: null, archiveSkippedReason: 'poll-deadline-exceeded' };
+    if (!await stillOwned()) {
+        return { finalized: true, pool: null, archiveSkippedReason: expired() ? 'poll-deadline-exceeded' : 'generation-superseded' };
     }
 
     const { shouldArchive } = resolveArchivePolicy({
@@ -130,8 +161,8 @@ export async function finalizeProviderTab(deps, {
             // Checked BEFORE the archive, not only after it. `archiveConversation`
             // clicks through the provider UI, so an after-only check meant the
             // clicks had already happened on a conversation nobody was waiting on.
-            if (expired()) {
-                return { finalized: true, pool: null, archiveSkippedReason: 'poll-deadline-exceeded' };
+            if (!await stillOwned()) {
+                return { finalized: true, pool: null, archiveSkippedReason: expired() ? 'poll-deadline-exceeded' : 'generation-superseded' };
             }
             const archiveResult = await archiveConversation(page, { conversationUrl });
             // Re-check AFTER the await. A caller bounded by a deadline can have
@@ -139,17 +170,25 @@ export async function finalizeProviderTab(deps, {
             // a session nobody is waiting on. Checking only at entry is not
             // enough for work that spans an await.
             if (archiveResult.ok) {
-                const archived = await updateSessionAsync(session.sessionId, { archived: true }, () => !expired());
+                const archived = await updateSessionForGeneration(
+                    session.sessionId,
+                    expectedGeneration,
+                    { archived: true },
+                    () => !expired(),
+                );
                 if (archived === DEADLINE_PASSED) {
                     return { finalized: true, pool: null, archiveSkippedReason: 'poll-deadline-exceeded' };
+                }
+                if (archived === GENERATION_CHANGED) {
+                    return { finalized: true, pool: null, archiveSkippedReason: 'generation-superseded' };
                 }
                 return { finalized: true, pool: null, archived: true };
             }
         } catch { /* archive is best-effort, fall through to pool */ }
     }
 
-    if (expired()) {
-        return { finalized: true, pool: null, archiveSkippedReason: 'poll-deadline-exceeded' };
+    if (!await stillOwned()) {
+        return { finalized: true, pool: null, archiveSkippedReason: expired() ? 'poll-deadline-exceeded' : 'generation-superseded' };
     }
 
     const port = deps?.getPort?.() || 9222;

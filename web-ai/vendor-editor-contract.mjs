@@ -3,6 +3,7 @@ import {
     INPUT_SELECTORS as CHATGPT_INPUT_SELECTORS,
     SEND_BUTTON_SELECTORS as CHATGPT_SEND_BUTTON_SELECTORS,
     countConversationTurns,
+    readLatestCommittedUserTurn,
     insertPromptIntoComposer,
     submitPromptFromComposer,
     verifyPromptCommitted,
@@ -18,6 +19,8 @@ import { UPLOAD_BUTTON_SELECTORS as CHATGPT_UPLOAD_BUTTON_SELECTORS } from './ch
 /**
  * @typedef {Object} EditorAdapterBaseline
  * @property {number} turnsCount
+ * @property {string|null} [userMessageId]
+ * @property {string|null} [userTurnId]
  */
 
 /**
@@ -62,7 +65,13 @@ export function createChatGptEditorAdapter(page, options = {}) {
             await page.locator(selector).first().waitFor({ state: 'visible', timeout: 10_000 });
         },
         async getCommitBaseline() {
-            return { turnsCount: await countConversationTurns(page) };
+            const userIdentity = await readLatestCommittedUserTurn(page);
+            const turnsCount = userIdentity ? -1 : await countConversationTurns(page);
+            return {
+                turnsCount,
+                userMessageId: userIdentity?.messageId || null,
+                userTurnId: userIdentity?.turnId || null,
+            };
         },
         async insertPrompt(text) {
             await insertPromptIntoComposer(page, text, options);
@@ -71,7 +80,12 @@ export function createChatGptEditorAdapter(page, options = {}) {
             return submitPromptFromComposer(page, { ...options, ...submitOptions });
         },
         async verifyPromptCommitted(prompt, baseline = {}, verifyOptions = {}) {
-            return verifyPromptCommitted(page, prompt, { ...verifyOptions, baselineTurns: baseline.turnsCount });
+            return verifyPromptCommitted(page, prompt, {
+                ...verifyOptions,
+                baselineTurns: baseline.turnsCount,
+                baselineUserMessageId: baseline.userMessageId || null,
+                baselineUserTurnId: baseline.userTurnId || null,
+            });
         },
     };
 }
