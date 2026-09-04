@@ -127,6 +127,16 @@ const PLACEHOLDER_PATTERNS = [
     /^chatgpt said:\s*answer now\s*$/i,
 ];
 
+// ChatGPT renders these as the complete body of the assistant turn when the
+// provider stops a generation. They are terminal for that exact response turn,
+// even if a stale ambient stop control is still mounted elsewhere on the page.
+const STOPPED_RESPONSE_PATTERNS = [
+    /^stopped thinking$/i,
+    /^thinking stopped$/i,
+    /^생각\s*중지됨$/,
+    /^생각\s*중단됨$/,
+];
+
 /**
  * @param {any} input
  */
@@ -1182,9 +1192,55 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         const correlatedWrapped = hasSubmittedUserAnchor
             ? wrapped
             : wrapped.slice(baseline.assistantCount);
-        const newSnapshots = [...correlatedWrapped, ...wrapperless]
-            .sort((a, b) => (a.domOrder ?? 0) - (b.domOrder ?? 0))
-            .filter(sample => isFinalAnswer(sample.text));
+        const correlatedSnapshots = [...correlatedWrapped, ...wrapperless]
+            .sort((a, b) => (a.domOrder ?? 0) - (b.domOrder ?? 0));
+        const stoppedSnapshot = correlatedSnapshots.at(-1) || null;
+        if (stoppedSnapshot && isStoppedAssistantResponse(stoppedSnapshot.text)) {
+            if (session && (stoppedSnapshot.messageId || stoppedSnapshot.turnId)
+                && (stoppedSnapshot.messageId !== responseMessageId || stoppedSnapshot.turnId !== responseTurnId)) {
+                const responseAnchor = await updateSessionForGeneration(session.sessionId, expectedGeneration, {
+                    responseMessageId: stoppedSnapshot.messageId || null,
+                    responseTurnId: stoppedSnapshot.turnId || null,
+                }, isActiveRun);
+                if (responseAnchor === DEADLINE_PASSED) throw POLL_EXPIRED;
+                if (responseAnchor === GENERATION_CHANGED) {
+                    return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+                }
+            }
+            const warnings = mergeObservationList(['provider-response-stopped'], observations);
+            if (session) {
+                const stopped = await updateSessionForGeneration(session.sessionId, expectedGeneration, {
+                    status: 'error',
+                    answer: null,
+                    lastError: {
+                        errorCode: 'provider.response-stopped',
+                        message: 'ChatGPT stopped before producing a final answer',
+                    },
+                    warnings,
+                }, isActiveRun);
+                if (stopped === DEADLINE_PASSED) throw POLL_EXPIRED;
+                if (stopped === GENERATION_CHANGED) {
+                    return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+                }
+            }
+            return {
+                ok: false,
+                vendor,
+                status: 'error',
+                url: page.url(),
+                ...(session ? { sessionId: session.sessionId, generation: expectedGeneration } : {}),
+                answerText: '',
+                baseline,
+                usedFallbacks: [],
+                warnings,
+                recoverable: true,
+                errorCode: 'provider.response-stopped',
+                stage: 'response-completion',
+                retryHint: 'send-follow-up',
+                error: 'ChatGPT stopped before producing a final answer',
+            };
+        }
+        const newSnapshots = correlatedSnapshots.filter(sample => isFinalAnswer(sample.text));
         const latestSnapshot = newSnapshots.at(-1) || null;
         const latest = latestSnapshot?.text || '';
         if (session && hasSubmittedUserAnchor && latestSnapshot
@@ -2567,6 +2623,12 @@ function extractConversationId(url) {
 /** @param {any} text */
 function isFinalAnswer(text) {
     return !PLACEHOLDER_PATTERNS.some(pattern => pattern.test(text));
+}
+
+/** @param {any} text */
+export function isStoppedAssistantResponse(text) {
+    const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+    return STOPPED_RESPONSE_PATTERNS.some(pattern => pattern.test(normalized));
 }
 
 /**

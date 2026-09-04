@@ -199,4 +199,70 @@ describe('logical ChatGPT session generations', () => {
             answer: null,
         });
     });
+
+    it('applies an explicit poll deadline before an expired-session fast path', async () => {
+        const {
+            applyExplicitSessionDeadlineOverride,
+            createSession,
+            expiredSessionTimeoutResult,
+            getSession,
+        } = await import('../../web-ai/session.mjs');
+        const session = createSession(
+            { vendor: 'chatgpt', prompt: 'first' },
+            {
+                targetId: 'target-a',
+                conversationUrl: 'https://chatgpt.com/c/A-1',
+                deadlineAt: new Date(Date.now() - 60_000).toISOString(),
+            },
+        );
+        const nextDeadline = new Date(Date.now() + 60_000).toISOString();
+
+        await applyExplicitSessionDeadlineOverride(
+            session.sessionId,
+            { deadline: nextDeadline },
+            1,
+        );
+
+        expect(expiredSessionTimeoutResult(session.sessionId)).toBeNull();
+        expect(getSession(session.sessionId)).toMatchObject({
+            sessionId: session.sessionId,
+            generation: 1,
+            targetId: 'target-a',
+            conversationId: 'A-1',
+            deadlineAt: nextDeadline,
+        });
+    });
+
+    it('does not let a stale command extend the next generation deadline', async () => {
+        const {
+            applyExplicitSessionDeadlineOverride,
+            beginSessionGeneration,
+            createSession,
+            getSession,
+        } = await import('../../web-ai/session.mjs');
+        const session = createSession(
+            { vendor: 'chatgpt', prompt: 'first' },
+            {
+                targetId: 'target-a',
+                conversationUrl: 'https://chatgpt.com/c/A-1',
+                deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+            },
+        );
+        const second = await beginSessionGeneration(
+            session.sessionId,
+            { vendor: 'chatgpt', prompt: 'second' },
+            {
+                targetId: 'target-a',
+                conversationUrl: 'https://chatgpt.com/c/A-1',
+                deadlineAt: new Date(Date.now() + 120_000).toISOString(),
+            },
+        );
+
+        await expect(applyExplicitSessionDeadlineOverride(
+            session.sessionId,
+            { timeout: 600 },
+            1,
+        )).rejects.toMatchObject({ errorCode: 'session.generation-superseded' });
+        expect(getSession(session.sessionId)?.deadlineAt).toBe(second.deadlineAt);
+    });
 });

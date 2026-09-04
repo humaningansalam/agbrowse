@@ -798,6 +798,59 @@ export function resolveDeadlineAt(input = {}, vendor = 'chatgpt') {
 }
 
 /**
+ * Resolve only a deadline the caller explicitly supplied for an existing
+ * session. Unlike {@link resolveDeadlineAt}, this returns null when neither
+ * --deadline nor --timeout was present, so an ordinary poll keeps inheriting
+ * the stored generation deadline.
+ *
+ * @param {WebAiEnvelope} [input]
+ * @param {number} [nowMs]
+ * @returns {string|null}
+ */
+export function resolveExplicitSessionDeadlineAt(input = {}, nowMs = Date.now()) {
+    if (input.deadlineAt) return new Date(input.deadlineAt).toISOString();
+    if (input.deadline) return new Date(input.deadline).toISOString();
+    if (input.timeout === undefined || input.timeout === null || String(input.timeout).trim() === '') return null;
+    const seconds = Number(input.timeout);
+    if (!Number.isFinite(seconds) || seconds <= 0) return null;
+    return new Date(nowMs + seconds * 1000).toISOString();
+}
+
+/**
+ * Apply an explicit poll/resume deadline before any expired-session fast path.
+ * The write is generation-fenced so a stale command cannot extend a newer
+ * prompt that started while it was preparing.
+ *
+ * @param {string} sessionId
+ * @param {WebAiEnvelope} [input]
+ * @param {number} [expectedGeneration]
+ * @returns {Promise<WebAiSession|null>}
+ */
+export async function applyExplicitSessionDeadlineOverride(sessionId, input = {}, expectedGeneration) {
+    const current = getSession(sessionId);
+    if (!current) return null;
+    if (COMPLETED_SESSION_STATUSES.has(current.status) || Boolean(current.completedAt)) return current;
+    const deadlineAt = resolveExplicitSessionDeadlineAt(input);
+    if (!deadlineAt) return current;
+    const generation = Number.isInteger(Number(expectedGeneration)) && Number(expectedGeneration) > 0
+        ? Number(expectedGeneration)
+        : sessionGeneration(current);
+    const updated = await updateSessionForGeneration(sessionId, generation, { deadlineAt });
+    if (updated === GENERATION_CHANGED) {
+        throw new WebAiError({
+            errorCode: 'session.generation-superseded',
+            stage: 'session-deadline',
+            retryHint: 'poll-latest-generation',
+            vendor: current.vendor || undefined,
+            mutationAllowed: false,
+            message: `session ${sessionId} advanced beyond generation ${generation} before its deadline override could be applied`,
+            evidence: { sessionId, generation },
+        });
+    }
+    return updated;
+}
+
+/**
  * Hardcoded default poll timeout (seconds) per normalized model tier.
  * Provider-specific long-reasoning tiers stay independent so one budget change
  * cannot silently change another provider's behavior.

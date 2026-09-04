@@ -117,6 +117,41 @@ describe('ChatGPT poll loop activity strata (G8 behavioural)', () => {
         expect(result.status).not.toBe('complete');
     });
 
+    it.each(['생각 중지됨', '생각 중단됨', 'Stopped thinking', 'Thinking stopped'])(
+        'terminates the exact response turn marked %s even when a stop control remains visible',
+        async (text) => {
+            const { page } = makePage({
+                activity: { strength: 'strong', evidence: 'stop-button' },
+                text,
+                finished: false,
+            });
+            const { result, session } = await poll(page, 30);
+
+            expect(result).toMatchObject({
+                ok: false,
+                status: 'error',
+                errorCode: 'provider.response-stopped',
+                retryHint: 'send-follow-up',
+            });
+            expect(getSession(session.sessionId)).toMatchObject({
+                generation: 1,
+                status: 'error',
+                answer: null,
+                lastError: { errorCode: 'provider.response-stopped' },
+            });
+        },
+    );
+
+    it('does not treat a real answer merely mentioning a stopped marker as terminal', async () => {
+        const { page } = makePage({
+            activity: { strength: 'none', evidence: '' },
+            text: 'The UI once displayed 생각 중지됨, but this is the final analysis.',
+            finished: true,
+        });
+        const { result } = await poll(page);
+        expect(result).toMatchObject({ ok: true, status: 'complete' });
+    });
+
     it('never completes without terminal evidence, even when quiet and stable', async () => {
         // Guards the `finished &&` half of the completion condition: deleting it
         // must fail here.

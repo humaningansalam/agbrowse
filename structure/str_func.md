@@ -16,7 +16,7 @@ aliases: [agbrowse source map, agbrowse str_func, agbrowse 파일 구조]
 
 ## 현재 구조 스냅샷
 
-마지막 측정: 2026-09-03.
+마지막 측정: 2026-09-04.
 
 | 경로 | 파일 수 | 라인 수 | 역할 |
 | --- | ---: | ---: | --- |
@@ -25,13 +25,13 @@ aliases: [agbrowse source map, agbrowse str_func, agbrowse 파일 구조]
 | `skills/search/` | 5 | 896 | standalone search skill doc (any CLI agent) |
 | `skills/vision-click/` | 4 | 1215 | screenshot to coordinate click helper |
 | `skills/web-ai/` | 3 | 910 | bundled agent workflow skill |
-| `web-ai/` | 122 | 35798 | provider automation, sessions, MCP, eval, policy, trace |
+| `web-ai/` | 122 | 35928 | provider automation, sessions, MCP, eval, policy, trace |
 | `web-ai/context-pack/` | 10 | 1821 | file selection, token budget, context rendering |
 | `web-ai/eval/` | 5 | 553 | offline provider DOM fixture harness |
 | `web-ai/policy/` | 4 | 297 | mutation and content-boundary guardrails |
 | `web-ai/trace/` | 5 | 444 | trace ID, redaction, report, writer helpers |
 | `scripts/` | 14 | 2478 | eval runner, release scripts, named release gates, strict-baseline / module-graph / bin smoke checks |
-| `test/unit/` | 177 | 30773 | deterministic module tests |
+| `test/unit/` | 177 | 30903 | deterministic module tests |
 | `test/integration/` | 25 | 5633 | CLI, MCP, policy, provider fixture tests |
 | `test/e2e/` | 1 | 50 | browser smoke coverage |
 | `test/spec/` | 2 | 35 | high-level contract specs |
@@ -80,9 +80,9 @@ aliases: [agbrowse source map, agbrowse str_func, agbrowse 파일 구조]
 | `skills/browser/adaptive-fetch/transforms.mjs` | 86 | URL transforms, HTML-to-text, content-type checks |
 | `skills/browser/adaptive-fetch/third-party-readers.mjs` | 46 | Jina Reader integration |
 | `skills/browser/adaptive-fetch/browser-runtime.mjs` | 38 | browser page acquisition and cleanup |
-| `web-ai/cli.mjs` | 2200 | `web-ai` subcommand parser and strict session-to-target command orchestration |
+| `web-ai/cli.mjs` | 2207 | `web-ai` subcommand parser and strict session-to-target command orchestration |
 | `web-ai/session-target-guard.mjs` | 69 | target-mismatch recovery envelopes for an explicitly identified session |
-| `web-ai/chatgpt.mjs` | 2606 | ChatGPT provider send/poll/query/status with streaming-safe recovery gates |
+| `web-ai/chatgpt.mjs` | 2668 | ChatGPT provider send/poll/query/status with streaming-safe recovery gates |
 | `web-ai/chatgpt-response-dom.mjs` | 639 | shared ChatGPT assistant DOM extraction plus the Node-side composer-scoped stop probe |
 | `web-ai/chatgpt-response-observer.mjs` | 200 | ChatGPT observer wake signal and timeout recovery metadata |
 | `web-ai/gemini-live.mjs` | 1107 | Gemini provider send/poll/query/status |

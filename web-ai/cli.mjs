@@ -30,6 +30,7 @@ import { cleanupIdleTabs, DEFAULT_MAX_TABS } from '../skills/browser/tab-lifecyc
 import { resolveSessionPage, withSessionPage } from './tab-recovery.mjs';
 import { withSessionCommandLock } from './session-store.mjs';
 import {
+    applyExplicitSessionDeadlineOverride,
     getSession,
     resolvePollTimeoutSec,
     resolveTimeoutDefaultSec,
@@ -1291,6 +1292,12 @@ async function runBoundCommand(command, deps, input, pollFn, stopFn) {
         // Poll observes one already-bound target. Do not hold the mutation
         // command lock for the whole long poll; target ownership is enforced by
         // the active-command row below, whose owner PID is reclaimable on death.
+        const startingSession = getSession(input.session);
+        await applyExplicitSessionDeadlineOverride(
+            input.session,
+            input,
+            startingSession ? sessionGeneration(startingSession) : undefined,
+        );
         const expiredBeforeResolve = expiredSessionTimeoutResult(input.session, input.vendor || 'chatgpt');
         if (expiredBeforeResolve) return expiredBeforeResolve;
         return withSessionPage(deps, input.session, async ({ page, targetId, session }) => {

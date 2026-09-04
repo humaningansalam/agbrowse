@@ -9,6 +9,7 @@ import {
     deriveTimeoutTier,
     resolveTimeoutDefaultSec,
     resolveDeadlineAt,
+    resolveExplicitSessionDeadlineAt,
     resolveTimeoutBudgetSec,
     resolvePollTimeoutSec,
 } from '../../web-ai/session.mjs';
@@ -203,6 +204,21 @@ describe('resolveTimeoutBudgetSec priority', () => {
 
     it('null session, no model: vendor default', () => {
         expect(resolveTimeoutBudgetSec({}, null, 'chatgpt', NOW)).toBe(1200);
+    });
+});
+
+describe('explicit existing-session deadline override', () => {
+    const NOW = new Date('2026-07-10T00:00:00.000Z').getTime();
+
+    it('does not invent an override when poll/resume omitted both flags', () => {
+        expect(resolveExplicitSessionDeadlineAt({}, NOW)).toBeNull();
+    });
+
+    it('uses --deadline exactly and otherwise derives it from explicit --timeout', () => {
+        const exact = '2099-01-01T00:00:00.000Z';
+        expect(resolveExplicitSessionDeadlineAt({ deadline: exact }, NOW)).toBe(exact);
+        expect(resolveExplicitSessionDeadlineAt({ timeout: 30 }, NOW))
+            .toBe(new Date(NOW + 30_000).toISOString());
     });
 });
 

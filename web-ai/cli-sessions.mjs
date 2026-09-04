@@ -10,7 +10,7 @@ import { grokPollWebAi } from './grok-live.mjs';
 import { isWorkSession, pollWorkSession } from './chatgpt-work-picker.mjs';
 import { resumeDeepResearch } from './chatgpt-deep-research.mjs';
 import { WebAiError } from './errors.mjs';
-import { getSession, listSessions, pruneSessionsOlderThan, resolvePollTimeoutSec, resolveTimeoutBudgetSec, expiredSessionTimeoutResult } from './session.mjs';
+import { applyExplicitSessionDeadlineOverride, getSession, listSessions, pruneSessionsOlderThan, resolvePollTimeoutSec, resolveTimeoutBudgetSec, expiredSessionTimeoutResult, sessionGeneration } from './session.mjs';
 import { resolveSessionPage, storedDeadlineStillActive, withSessionPage, withSessionPageGuarded } from './tab-recovery.mjs';
 import { withSessionCommandLock } from './session-store.mjs';
 import { buildSessionDoctorReport } from './session-doctor.mjs';
@@ -93,8 +93,9 @@ export async function runSessionsCommand(args, values, deps, input) {
     if (sub === 'resume') {
         const id = rest[0] || values.session;
         if (!id) throw new WebAiError({ errorCode: 'internal.unhandled', stage: 'internal', retryHint: 'report', message: 'sessions resume <id> requires a sessionId (positional or --session)' });
-        const session = getSession(id);
+        let session = getSession(id);
         if (!session) throw new WebAiError({ errorCode: 'input.session-not-found', stage: 'input-preflight', retryHint: 'list-sessions', message: `no session record for ${id} — run \`agbrowse web-ai sessions list\``, evidence: { sessionId: id } });
+        session = await applyExplicitSessionDeadlineOverride(id, input, sessionGeneration(session)) || session;
         // Refuse an expired session before resolving its page. The poll clamp
         // keeps a positive minimum so providers cannot read it as "no budget",
         // which means an expired session would otherwise still open a tab and
