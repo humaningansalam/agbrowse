@@ -453,9 +453,8 @@ export function readAssistantSnapshotSources({
     const textOf = (/** @type {any} */ node) => String(node.innerText || node.textContent || '').trim();
     const describe = (/** @type {any} */ node) => {
         const messageNode = node.matches?.('[data-message-id]') ? node : node.querySelector?.('[data-message-id]');
-        const turnNode = node.matches?.('[data-testid^="conversation-turn"]')
-            ? node
-            : node.querySelector?.('[data-testid^="conversation-turn"]');
+        const turnNode = node.closest?.('[data-testid^="conversation-turn"]')
+            || node.querySelector?.('[data-testid^="conversation-turn"]');
         return {
             text: textOf(node),
             messageId: messageNode?.getAttribute?.('data-message-id') || null,
@@ -488,16 +487,20 @@ export function readAssistantSnapshotSources({
     const submittedUser = userAnchorExpected
         ? userNodes.findLast(node => {
             const identity = userIdentity(node);
-            return (!submittedUserMessageId || identity.messageId === submittedUserMessageId)
-                && (!submittedUserTurnId || identity.turnId === submittedUserTurnId);
+            // Message identity survives reload/virtualization; turn-N is only a
+            // presentation index and is used solely for legacy id-less rows.
+            return submittedUserMessageId
+                ? identity.messageId === submittedUserMessageId
+                : identity.turnId === submittedUserTurnId;
         }) || null
         : userNodes[userNodes.length - 1] || null;
 
     const responseAnchorExpected = Boolean(responseMessageId || responseTurnId);
     const responseMatches = (/** @type {any} */ node) => {
         const identity = describe(node);
-        return (!responseMessageId || identity.messageId === responseMessageId)
-            && (!responseTurnId || identity.turnId === responseTurnId);
+        return responseMessageId
+            ? identity.messageId === responseMessageId
+            : identity.turnId === responseTurnId;
     };
     const responseAnchorFound = responseAnchorExpected && wrappedNodes.some(responseMatches);
 
@@ -505,9 +508,14 @@ export function readAssistantSnapshotSources({
     // user turn. If that user node has since been virtualized, a previously
     // learned exact response identity remains sufficient. Otherwise fail closed
     // to no wrapped candidates instead of re-admitting historical answers.
+    const submittedTurn = submittedUser?.closest?.('[data-testid^="conversation-turn"]') || submittedUser;
+    const nextUser = submittedTurn ? userNodes.find(node =>
+        !submittedTurn.contains(node) && (submittedTurn.compareDocumentPosition(node) & FOLLOWING) !== 0) : null;
+    const followsThisUser = node => Boolean(submittedTurn)
+        && (submittedTurn.compareDocumentPosition(node) & FOLLOWING) !== 0
+        && (!nextUser || (node.compareDocumentPosition(nextUser) & FOLLOWING) !== 0);
     if (submittedUser) {
-        wrappedNodes = wrappedNodes.filter(node =>
-            (submittedUser.compareDocumentPosition(node) & FOLLOWING) !== 0);
+        wrappedNodes = wrappedNodes.filter(followsThisUser);
     } else if (responseAnchorFound) {
         wrappedNodes = wrappedNodes.filter(responseMatches);
     } else if (userAnchorExpected) {
@@ -518,8 +526,7 @@ export function readAssistantSnapshotSources({
         (selector) => Array.from(document.querySelectorAll(selector))))
         .filter((node) => isVisible(node))
         .filter((node) => !node.closest?.(WRAPPER_SELECTORS.join(', ')))
-        .filter((node) => Boolean(submittedUser)
-            && (submittedUser.compareDocumentPosition(node) & FOLLOWING) !== 0)
+        .filter(followsThisUser)
         .filter((node) => textOf(node));
 
     const order = new Map(orderNodes([...wrappedNodes, ...wrapperlessNodes])

@@ -133,7 +133,8 @@ Provider:
                         Gemini  models: flash-lite, flash, pro
                         Gemini  tool:   deepthink
                         Grok:   auto, fast, expert, thinking, heavy
-  --family <alias>    ChatGPT family alias: gpt-5.6-sol, gpt-5.5, o3.
+  --family <name>     Exact UI family label or normalized identifier; discovered
+                      from this account's current Model menu, not a fixed list.
                       Preserves the currently checked tier.
   --effort <alias>    ChatGPT reasoning effort. The reasoning-effort menu is
                       ONLY touched when this flag is provided; otherwise the
@@ -258,7 +259,7 @@ Tab ownership policy:
   never checked out to another session.
   Retention defaults: maxPerKey=3, globalMax=8, TTL=30m. Override via
   AGBROWSE_PROVIDER_POOL_MAX_PER_KEY / _GLOBAL_MAX / _TTL.
-  Active session caps default to per-key=5 and global=14. Override via
+  Active session counts are unlimited by default. Optional limits use
   AGBROWSE_PROVIDER_ACTIVE_MAX_PER_KEY / _GLOBAL_MAX.
   Expired or overflow completed tabs are closed with CDP; their session can
   recover only from its own persisted conversation URL.

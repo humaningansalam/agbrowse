@@ -89,9 +89,9 @@ describe('active tab persistence contract', () => {
         const end = browserSrc.indexOf('async function listTabs', start);
         const block = browserSrc.slice(start, end);
         expect(block).toMatch(/activeTargetId/);
-        expect(block).toMatch(/getPageTargetId\(page\)/);
-        expect(block).toMatch(/pageTargetId === activeTargetId/);
-        expect(block).toMatch(/present in CDP but not attached as a Playwright page/);
-        expect(block.indexOf('activeTargetId')).toBeLessThan(block.indexOf('pages[pages.length - 1]'));
+        expect(block).toContain('getPageByTargetId(port, activeTargetId)');
+        expect(block).not.toContain('connectCdp(');
+        expect(block).not.toContain('for (const page');
+        expect(block.indexOf('activeTargetId')).toBeLessThan(block.indexOf('const fallback'));
     });
 });

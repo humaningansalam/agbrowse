@@ -48,7 +48,7 @@
         "skills/browser/tab-manager.mjs": {
             "sync": 8,
             "cdp": 7,
-            "nonLiteralSend": 1
+            "nonLiteralSend": 2
         },
         "skills/browser/update-check.mjs": {
             "sync": 9,

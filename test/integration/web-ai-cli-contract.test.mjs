@@ -44,7 +44,7 @@ describe('web-ai CLI contract', () => {
         expect(result.stdout).toContain('Provider:');
         expect(result.stdout).toContain('--context-from-files');
         expect(result.stdout).toContain('--effort <alias>');
-        expect(result.stdout).toContain('--family <alias>');
+        expect(result.stdout).toContain('--family <name>');
         expect(result.stdout).toContain('ChatGPT: instant, thinking, pro');
         expect(result.stdout).toContain('Tab ownership policy:');
         expect(result.stdout).toContain('leaseClosedTabs');

@@ -23,8 +23,8 @@ import { homedir } from 'node:os';
  * @typedef {{ activate?: boolean, reuseBlank?: boolean, onCreated?: (targetId: string) => void|Promise<void> }} TabOpts
  */
 
-/** @type {Map<number, CdpConnectionEntry>} */
-const cdpConnections = new Map();
+/** One in-process connection per exact page, never a browser-wide attach. */
+const targetConnections = new Map();
 /** @type {Map<string, number>} */
 const tabActivity = new Map();
 let tabActivityLoaded = false;
@@ -102,54 +102,10 @@ async function loadPlaywright() {
 
 /**
  * @param {number} port
- * @returns {Promise<Browser>}
- */
-async function getBrowserForPort(port) {
-    const existing = cdpConnections.get(port);
-    if (existing?.browser?.isConnected?.()) return existing.browser;
-
-    const { chromium } = await loadPlaywright();
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 10000 });
-    browser.on('disconnected', () => cdpConnections.delete(port));
-    cdpConnections.set(port, { browser, connectedAt: Date.now() });
-    return browser;
-}
-
-/**
- * @param {number} port
- * @returns {Promise<{ browser: Browser, cdpUrl: string }>}
- */
-async function connectCdp(port) {
-    const browser = await getBrowserForPort(port);
-    return { browser, cdpUrl: `http://127.0.0.1:${port}` };
-}
-
-/**
- * @param {number} port
- * @returns {Promise<Page|null>}
- */
-async function getActivePage(port) {
-    const browser = await getBrowserForPort(port);
-    const pages = browser.contexts().flatMap(c => c.pages());
-    return pages[pages.length - 1] || null;
-}
-
-/**
- * @param {number} port
  * @returns {Promise<CDPSession|CdpSessionLike|null>}
  */
 async function getCdpSession(port) {
-    try {
-        const page = await getActivePage(port);
-        if (page) return page.context().newCDPSession(page);
-        const browser = await getBrowserForPort(port);
-        if (typeof browser.newBrowserCDPSession === 'function') {
-            return browser.newBrowserCDPSession();
-        }
-    } catch (error) {
-        const msg = String(/** @type {{ message?: string }} */ (error)?.message || '');
-        if (!msg.includes('Browser.setDownloadBehavior')) throw error;
-    }
+    // Target creation/closure is browser-scoped and needs no renderer attach.
     return createRawBrowserCdpSession(port);
 }
 
@@ -158,10 +114,11 @@ async function getCdpSession(port) {
  * @returns {Promise<CdpSessionLike|null>}
  */
 async function createRawBrowserCdpSession(port) {
-    const version = /** @type {{ webSocketDebuggerUrl?: string }} */ (await fetch(`http://127.0.0.1:${port}/json/version`).then(resp => resp.json()));
+    const version = /** @type {{ webSocketDebuggerUrl?: string }} */ (await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(5_000) }).then(resp => resp.json()));
     const endpoint = version?.webSocketDebuggerUrl;
-    if (!endpoint || typeof WebSocket !== 'function') return null;
-    const ws = new WebSocket(endpoint);
+    if (!endpoint) return null;
+    const WebSocketImpl = globalThis.WebSocket || (await import('playwright-core/lib/utilsBundle')).ws;
+    const ws = new WebSocketImpl(endpoint);
     let nextId = 1;
     /** @type {Map<number, { resolve: (value: any) => void, reject: (reason?: unknown) => void }>} */
     const pending = new Map();
@@ -177,20 +134,27 @@ async function createRawBrowserCdpSession(port) {
         else resolve(payload.result || {});
     });
     await new Promise((resolve, reject) => {
-        ws.addEventListener('open', () => resolve(undefined), { once: true });
-        ws.addEventListener('error', reject, { once: true });
+        const timer = setTimeout(() => { ws.close(); reject(new Error('CDP browser connection timed out')); }, 5_000);
+        ws.addEventListener('open', () => { clearTimeout(timer); resolve(undefined); }, { once: true });
+        ws.addEventListener('error', err => { clearTimeout(timer); reject(err); }, { once: true });
     });
     return {
         async send(method, params = {}) {
             const id = nextId++;
-            const promise = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+            const promise = new Promise((resolve, reject) => {
+                const timer = setTimeout(() => { pending.delete(id); reject(new Error(`CDP ${method} timed out`)); }, 5_000);
+                pending.set(id, {
+                    resolve: value => { clearTimeout(timer); resolve(value); },
+                    reject: reason => { clearTimeout(timer); reject(reason); },
+                });
+            });
             ws.send(JSON.stringify({ id, method, params }));
             return promise;
         },
         async detach() {
             for (const { reject } of pending.values()) reject(new Error('CDP session detached'));
             pending.clear();
-            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close();
+            if (ws.readyState === 1 || ws.readyState === 0) ws.close();
         }
     };
 }
@@ -200,7 +164,7 @@ async function createRawBrowserCdpSession(port) {
  * @returns {Promise<RawTab[]>}
  */
 async function listTabs(port) {
-    const resp = await fetch(`http://127.0.0.1:${port}/json/list`);
+    const resp = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(5_000) });
     const all = /** @type {RawTab[]} */ (await resp.json());
     return all.filter(t => t.type === 'page');
 }
@@ -458,21 +422,94 @@ export async function waitForPageByTargetId(port, targetId, timeoutMs = 10_000) 
  * @returns {Promise<Page|null>}
  */
 export async function getPageByTargetId(port, targetId) {
-    const browser = await getBrowserForPort(port);
-    const contexts = browser.contexts();
-    for (const context of contexts) {
-        for (const page of context.pages()) {
-            const session = await context.newCDPSession(page);
-            try {
-                const info = /** @type {{ targetInfo?: { targetId?: string } }} */ (await session.send('Target.getTargetInfo'));
-                if (info.targetInfo?.targetId === targetId) {
-                    markTabActive(targetId);
-                    return page;
-                }
-            } finally {
-                await session.detach().catch(() => { });
+    if (!targetId) return null;
+    const key = `${port}:${targetId}`;
+    const existing = targetConnections.get(key);
+    if (existing) return existing;
+    const forget = () => {
+        if (targetConnections.get(key) === connecting) targetConnections.delete(key);
+    };
+    const connecting = connectExactTarget(port, targetId, forget).catch(error => {
+        if (targetConnections.get(key) === connecting) targetConnections.delete(key);
+        throw error;
+    });
+    targetConnections.set(key, connecting);
+    return connecting;
+}
+
+/**
+ * Playwright 1.59.1's in-process transport seam is deliberately version-pinned
+ * in package.json. No proxy, server, monkey patch or second Chrome is involved.
+ * Replace ONLY browser-wide auto-attach with CDP's exact-target attach scope.
+ * Child-frame attachment remains Playwright's job on that page's CDP session.
+ * @param {number} port
+ * @param {string} targetId
+ * @param {() => void} forget
+ * @returns {Promise<Page>}
+ */
+async function connectExactTarget(port, targetId, forget) {
+    const { chromium } = await loadPlaywright();
+    const connect = /** @type {any} */ (chromium)._connectOverCDPTransport;
+    if (typeof connect !== 'function') throw new Error('Pinned Playwright target transport unavailable; reinstall agbrowse dependencies');
+    const version = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(5_000) }).then(r => r.json());
+    const WebSocketImpl = globalThis.WebSocket || (await import('playwright-core/lib/utilsBundle')).ws;
+    const ws = new WebSocketImpl(version.webSocketDebuggerUrl);
+    let timer;
+    let closed = false;
+    const close = () => {
+        if (closed) return;
+        closed = true;
+        forget();
+        ws.close();
+    };
+    /** @type {any} */
+    const transport = {
+        send(message) {
+            if (!message.sessionId && message.method === 'Target.setAutoAttach' && message.params?.autoAttach) {
+                message = { ...message, method: 'Target.autoAttachRelated', params: { targetId, waitForDebuggerOnStart: false } };
             }
-        }
-    }
-    return null;
+            // Connecting an observer must not change profile-wide download policy.
+            if (!message.sessionId && message.method === 'Browser.setDownloadBehavior') {
+                queueMicrotask(() => transport.onmessage?.({ id: message.id, sessionId: message.sessionId, result: {} }));
+                return;
+            }
+            ws.send(JSON.stringify(message));
+        },
+        close,
+    };
+    ws.addEventListener('message', event => {
+        if (closed) return;
+        try { transport.onmessage?.(JSON.parse(String(event.data))); }
+        catch { close(); }
+    });
+    ws.addEventListener('close', () => { closed = true; forget(); transport.onclose?.(); });
+    ws.addEventListener('error', close);
+    try {
+        const timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => { close(); reject(new Error(`CDP target ${targetId} attachment timed out`)); }, 10_000);
+        });
+        const connected = (async () => {
+            await new Promise((resolve, reject) => {
+                ws.addEventListener('open', resolve, { once: true });
+                ws.addEventListener('error', reject, { once: true });
+                ws.addEventListener('close', () => reject(new Error(`CDP target ${targetId} connection closed`)), { once: true });
+            });
+            const browser = await connect.call(chromium, transport);
+            if (closed) { await browser.close(); throw new Error(`CDP target ${targetId} connection expired`); }
+            const pages = browser.contexts().flatMap(context => context.pages());
+            if (pages.length !== 1) throw new Error(`CDP exact-target attach returned ${pages.length} pages for ${targetId}`);
+            const page = pages[0];
+            const cdp = await page.context().newCDPSession(page);
+            try {
+                const { targetInfo } = await cdp.send('Target.getTargetInfo');
+                if (targetInfo?.targetId !== targetId) throw new Error('CDP exact-target identity mismatch');
+            } finally { await cdp.detach(); }
+            if (closed) throw new Error(`CDP target ${targetId} attachment expired`);
+            page.once('close', close);
+            markTabActive(targetId);
+            return page;
+        })();
+        return await Promise.race([connected, timeout]);
+    } catch (error) { close(); throw error; }
+    finally { clearTimeout(timer); }
 }

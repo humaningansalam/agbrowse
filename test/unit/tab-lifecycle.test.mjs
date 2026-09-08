@@ -171,7 +171,7 @@ describe('tab lifecycle cleanup selection', () => {
         expect(source).toContain('function isReusableBlankTab');
         expect(source).toContain('opts.reuseBlank !== false');
         expect(source).toContain('reusedBlank: true');
-        expect(source).toContain('newBrowserCDPSession');
+        expect(source).not.toContain('chromium.connectOverCDP(');
         expect(source).toContain('createRawBrowserCdpSession');
         expect(source).toContain('createTargetWithWindowFallback');
     });
@@ -300,6 +300,23 @@ describe('tab lifecycle cleanup selection', () => {
 
             const [lease] = await listLeases();
             expect(lease.ownerPid).toBe(process.pid);
+        } finally {
+            if (previousHome === undefined) delete process.env.BROWSER_AGENT_HOME;
+            else process.env.BROWSER_AGENT_HOME = previousHome;
+            temp.cleanup();
+        }
+    });
+
+    it('does not impose an implicit provider or profile active-session cap', async () => {
+        const temp = createTempBrowserEnv('agbrowse-no-default-active-cap-');
+        const previousHome = process.env.BROWSER_AGENT_HOME;
+        process.env.BROWSER_AGENT_HOME = temp.homeDir;
+        try {
+            for (let i = 0; i < 16; i += 1) {
+                await recordActiveLease({ port: 65_533, vendor: 'chatgpt',
+                    targetId: `independent-${i}`, sessionId: `session-${i}`, url: `https://chatgpt.com/c/${i}` });
+            }
+            expect(await listLeases()).toHaveLength(16);
         } finally {
             if (previousHome === undefined) delete process.env.BROWSER_AGENT_HOME;
             else process.env.BROWSER_AGENT_HOME = previousHome;

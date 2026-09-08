@@ -21,6 +21,21 @@ afterEach(() => {
 });
 
 describe('logical ChatGPT session generations', () => {
+    it('rejects conversation navigation even when the CDP target itself is unchanged', async () => {
+        const { pollWebAi } = await import('../../web-ai/chatgpt.mjs');
+        const { createSession } = await import('../../web-ai/session.mjs');
+        const session = createSession({ vendor: 'chatgpt', prompt: 'q' }, {
+            targetId: 'same-target', conversationUrl: 'https://chatgpt.com/c/A',
+            deadlineAt: new Date(Date.now() + 60_000).toISOString(), envelopeSummary: { assistantCount: 0 },
+        });
+        await expect(pollWebAi({
+            getPage: async () => ({ url: () => 'https://chatgpt.com/c/B' }),
+            getTargetId: async () => 'same-target',
+        }, { session: session.sessionId, timeout: 2 })).rejects.toMatchObject({
+            errorCode: 'session.conversation-mismatch', mutationAllowed: false,
+        });
+    });
+
     it('creates generation 1 with canonical immutable conversation identity', async () => {
         const { createSession } = await import('../../web-ai/session.mjs');
         const session = createSession(

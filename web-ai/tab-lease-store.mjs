@@ -98,11 +98,11 @@ const DEFAULT_POOL_GLOBAL_MAX = parseProviderLimitEnv(
 );
 const DEFAULT_ACTIVE_MAX_PER_KEY = parseProviderLimitEnv(
     process.env.AGBROWSE_PROVIDER_ACTIVE_MAX_PER_KEY,
-    5,
+    Number.POSITIVE_INFINITY,
 );
 const DEFAULT_ACTIVE_GLOBAL_MAX = parseProviderLimitEnv(
     process.env.AGBROWSE_PROVIDER_ACTIVE_GLOBAL_MAX,
-    14,
+    Number.POSITIVE_INFINITY,
 );
 
 export class ProviderActiveCapacityError extends Error {

@@ -52,7 +52,7 @@ export const WEB_AI_TOOLS = {
             provider: { ...providerSchema, default: 'chatgpt' },
             vendor: providerSchema,
             surface: { type: 'string', enum: ['chat'] },
-            family: { type: 'string', enum: ['gpt-5.6-sol', 'gpt-5.5', 'o3'] },
+            family: { type: 'string', minLength: 1, maxLength: 128, description: 'Exact family label or normalized identifier from the current ChatGPT Model menu. Omit to retain the current family; availability is verified in the UI.' },
             model: { type: 'string' },
             effort: { type: 'string', enum: ['medium', 'high', 'xhigh', 'extra-high', 'extra_high', 'extra high', 'light', 'low', 'standard', 'normal', 'regular', 'default', 'extended', 'heavy'] },
             reasoningEffort: { type: 'string', enum: ['medium', 'high', 'xhigh', 'extra-high', 'extra_high', 'extra high', 'light', 'low', 'standard', 'normal', 'regular', 'default', 'extended', 'heavy'] },

@@ -706,7 +706,14 @@ ChatGPT current contract (2026-07-10):
 | `--family gpt-5.6-sol` | select the GPT-5.6 Sol family |
 | `--family gpt-5.5` | select GPT-5.5 |
 | `--family o3` | select o3 |
-| (omit `--family`) | preserve current UI family selection (zero submenu mutation) |
+| `--family "<UI label>"` | select the exact family discovered in this account's current menu; new releases do not require a CLI allowlist update |
+| (omit `--family`) | preserve current UI family selection; inspect and verify it without selecting another family |
+
+Family names are discovered from the owned model picker, not from a fixed
+release list. `latest` matches the localized Latest option; it is not an alias
+for a particular release. Tier `pro` alone does not prove a named family.
+Explicit model, family or effort requests must be verified before the prompt
+is sent. An unavailable selector never means "already selected".
 
 `--family` is ChatGPT-only and preserves the checked tier. `--effort` without
 `--model` or `--family` targets the current ChatGPT tier; current Pro fails with

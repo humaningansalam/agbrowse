@@ -6,7 +6,7 @@ import { WebAiError } from './errors.mjs';
 /** @typedef {'instant'|'thinking'|'pro'} ModelChoice */
 /** @typedef {'medium'|'high'|'xhigh'} EffortChoice */
 /** @typedef {'chat'|'work'} ChatGptSurface */
-/** @typedef {'gpt-5.6-sol'|'gpt-5.5'|'o3'} FamilyChoice */
+/** @typedef {string} FamilyChoice UI-discovered family, not a release allowlist. */
 /** @typedef {{ label: string, retirementWarning?: string }} FamilyOptionConfig */
 /** @typedef {{ label: string|null, changed: boolean, verified: boolean }} FamilySelectionEvidence */
 /** @typedef {'chat'|'work'|'ambiguous'|'legacy'} ChatGptSurfaceDiscriminator */
@@ -36,11 +36,11 @@ export const CHATGPT_MODEL_SELECTOR_BUTTONS = [
 ];
 
 const CHATGPT_COMPOSER_MODEL_PILL_SELECTORS = [
-    'button[aria-haspopup="menu"]',
-    'button.__composer-pill[aria-haspopup="menu"]',
-    '[role="button"].__composer-pill[aria-haspopup="menu"]',
-    'button.__composer-pill',
-    '[role="button"].__composer-pill',
+    'form button.__composer-pill[aria-haspopup="menu"]',
+    'form [role="button"].__composer-pill[aria-haspopup="menu"]',
+    'form button[aria-haspopup="menu"]',
+    'form button.__composer-pill',
+    'form [role="button"].__composer-pill',
 ];
 
 const CHATGPT_MODEL_MENU_ITEM_SELECTOR = '[data-testid^="model-switcher-gpt-"]';
@@ -247,13 +247,6 @@ export const CHATGPT_FAMILY_OPTIONS = Object.freeze({
     o3: { label: 'o3' },
 });
 
-/** @type {Readonly<Record<string, FamilyChoice>>} */
-const FAMILY_ALIASES = Object.freeze({
-    'gpt-5.6-sol': 'gpt-5.6-sol',
-    'gpt-5.5': 'gpt-5.5',
-    o3: 'o3',
-});
-
 /** @type {Readonly<Record<string, ModelChoice>>} */
 const MODEL_ALIASES = {
     instant: 'instant',
@@ -295,7 +288,7 @@ const PRO_UNENFORCED_LEGACY_EFFORTS = new Set([
 export const CHATGPT_SURFACE_RADIO_SELECTOR = 'button[role="radio"]';
 export const CHATGPT_CHAT_PICKER_TRIGGER_SELECTOR = 'button[aria-haspopup="menu"]';
 const CHATGPT_POWER_PICKER_ROOT_SELECTOR =
-    '[role="menu"][data-state="open"]:has([role="menuitem"][aria-label="Power"])';
+    '[role="menu"][data-state="open"]:has([role="slider"]), [role="menu"][data-state="open"]:has([role="menuitem"][aria-label="Power"])';
 export const CHATGPT_OPEN_PICKER_CONTENT_SELECTOR = [
     '[role="menu"][data-state="open"] [data-testid="composer-intelligence-picker-content"]',
     CHATGPT_POWER_PICKER_ROOT_SELECTOR,
@@ -330,9 +323,15 @@ export function normalizeChatGptEffortChoice(effort) {
  * @returns {FamilyChoice|null}
  */
 export function normalizeChatGptFamilyChoice(family) {
-    const key = String(family || '').trim().toLowerCase();
-    return key ? FAMILY_ALIASES[key] || null : null;
+    const key = String(family || '').normalize('NFKC').trim().toLowerCase()
+        .replace(/[\u2010-\u2015\u2212]/g, '-').replace(/[\s_]+/g, '-');
+    // A moving provider selection, never an alias for a particular model version.
+    if (['latest', '최신', '最新'].includes(key)) return 'latest';
+    return key && key.length <= 128 && !/[\u0000-\u001f\u007f]/.test(key) ? key : null;
 }
+
+/** Causal ownership of the currently opened Model submenu, scoped to a page. */
+const familyMenuOwners = new WeakMap();
 
 /**
  * @param {unknown} model
@@ -429,7 +428,7 @@ export async function selectChatGptModel(page, model, options = {}) {
         return {
             requested: requested || null,
             selected: null,
-            alreadySelected: true,
+            alreadySelected: false,
             effort: null,
             requestedEffort: requestedEffort || null,
             usedFallbacks: [...usedFallbacks, 'model-selector-unavailable-current-model'],
@@ -449,13 +448,8 @@ export async function selectChatGptModel(page, model, options = {}) {
     /** @type {FamilySelectionEvidence | null} */
     let familyEvidence = null;
     if (requestedFamily) {
-        try {
-            familyEvidence = await selectChatGptFamily(page, requestedFamily);
-            await openModelMenu(page, usedFallbacks);
-        } catch (err) {
-            if (!isSelectionUnavailable(err)) throw err;
-            warnings.push(`family ${requestedFamily} was not enforced: ${errorMessage(err)}`);
-        }
+        familyEvidence = await selectChatGptFamily(page, requestedFamily);
+        await openModelMenu(page, usedFallbacks);
     } else {
         familyEvidence = await readVisibleChatGptFamilyEvidence(page);
     }
@@ -495,7 +489,7 @@ export async function selectChatGptModel(page, model, options = {}) {
                 }
                 throw new WebAiError({ errorCode: 'provider.model-mismatch', stage: 'provider-select-mode', vendor: 'chatgpt', retryHint: 'model-fallback', message: `ChatGPT model option not found: ${requested}`, evidence: { requested } });
             }
-            await option.click({ timeout: 5_000 });
+            await option.click({ timeout: 5_000, noWaitAfter: true });
             await page.waitForTimeout(750).catch(() => undefined);
             await openModelMenu(page, usedFallbacks);
             currentEvidence = await readCheckedModelEvidence(page, requested);
@@ -530,7 +524,7 @@ export async function selectChatGptModel(page, model, options = {}) {
         // effort as selected without requiring a detached Effort portal.
         const powerSliderEffortLabel = String(currentEvidence?.label || '')
             .split(/\r?\n/)[0]
-            .replace(/,\s*\d+\s+of\s+\d+\.?$/i, '')
+            .replace(/[,，].*$/, '')
             .trim();
         const powerSliderEffort = targetModel === 'thinking'
             ? (
@@ -595,28 +589,25 @@ export async function selectChatGptModel(page, model, options = {}) {
         observedEffort = effortChoiceFromPowerTierLabel(stop.label, stop.index);
     }
     let finalFamilyEvidence = familyEvidence;
-    if (requestedFamily) {
+    if (requestedFamily || familyEvidence?.label) {
         await openSimplifiedIntelligenceSubmenu(page, { forceFamily: true });
         finalFamilyEvidence = await readVisibleChatGptFamilyEvidence(page);
     }
     await closeModelMenu(page);
-    const proConflict = requestedFamily === 'gpt-5.6-sol'
-        ? await readActiveProComposerPill(page)
-        : null;
-    const expectedFamilyLabel = requestedFamily ? CHATGPT_FAMILY_OPTIONS[requestedFamily].label : null;
-    if (requestedFamily && (!finalFamilyEvidence?.verified || finalFamilyEvidence.label !== expectedFamilyLabel)) {
-        throw familyMismatch(requestedFamily, expectedFamilyLabel);
+    const activeProPill = await readActiveProComposerPill(page);
+    if (activeProPill && targetModel !== 'pro') {
+        throw new WebAiError({ errorCode: 'provider.model-mismatch', stage: 'provider-select-mode', vendor: 'chatgpt',
+            retryHint: 'inspect-model-picker', message: 'Composer tier disagrees with the requested tier',
+            evidence: { requestedFamily, expectedModel: targetModel, activeComposerLabel: activeProPill } });
     }
-    if (proConflict) {
-        throw new WebAiError({
-            errorCode: 'provider.model-mismatch',
-            stage: 'provider-select-mode',
-            vendor: 'chatgpt',
-            retryHint: 'model-fallback',
-            message: `ChatGPT family verification failed: requested ${requestedFamily}; active composer state is ${proConflict}`,
-            evidence: { requestedFamily, expectedFamilyLabel, activeComposerLabel: proConflict },
-        });
+    const expectedFamilyLabel = familyEvidence?.label || requestedFamily || null;
+    const expectedFamily = requestedFamily || normalizeChatGptFamilyChoice(familyEvidence?.label);
+    const familyVerified = !expectedFamily || (finalFamilyEvidence?.verified === true
+        && normalizeChatGptFamilyChoice(finalFamilyEvidence.label) === expectedFamily);
+    if (!familyVerified && (requestedFamily || finalFamilyEvidence?.verified)) {
+        throw familyMismatch(expectedFamily, expectedFamilyLabel);
     }
+    if (!familyVerified) warnings.push('family-selection-unverified');
     if (after !== targetModel) {
         usedFallbacks.push('model-verification-unavailable-current-model');
         warnings.push(`model ${targetModel} was not verified; current detected model is ${after || 'unknown'}`);
@@ -639,13 +630,13 @@ export async function selectChatGptModel(page, model, options = {}) {
     }
     const verified = after === targetModel
         && effortVerified
-        && (!requestedFamily || finalFamilyEvidence?.verified === true);
+        && familyVerified;
     // An unverified effort must not be reported as applied, nor as "already selected".
     const effortReportable = effortVerified ? selectedEffort : null;
     return {
         requested: requested || targetModel,
         selected: after,
-        alreadySelected: !modelChanged && !effortReportable?.changed && effortVerified,
+        alreadySelected: !modelChanged && !effortReportable?.changed && verified,
         effort: effortReportable?.selected || null,
         requestedEffort: requestedEffort || null,
         usedFallbacks,
@@ -718,7 +709,7 @@ function buildModelSelectionWarning(requested, requestedEffort, err) {
     const effortText = requestedEffort
         ? `; requested effort ${requestedEffort} was not enforced`
         : '';
-    return `${modelText}${effortText}, continuing with current ChatGPT model: ${errorMessage(err)}`;
+    return `${modelText}${effortText}; requested settings remain unverified: ${errorMessage(err)}`;
 }
 
 /**
@@ -731,10 +722,14 @@ function errorMessage(err) {
 
 /** @param {Page} page */
 async function closeModelMenu(page) {
-    for (let i = 0; i < 3; i += 1) {
-        if (!(await isModelMenuOpen(page))) return;
-        await page.keyboard.press('Escape').catch(() => undefined);
-        await page.waitForTimeout(250).catch(() => undefined);
+    try {
+        for (let i = 0; i < 3; i += 1) {
+            if (!(await isModelMenuOpen(page))) return;
+            await page.keyboard.press('Escape').catch(() => undefined);
+            await page.waitForTimeout(250).catch(() => undefined);
+        }
+    } finally {
+        familyMenuOwners.delete(page);
     }
 }
 
@@ -826,7 +821,7 @@ async function openModelMenu(page, usedFallbacks) {
         for (const selector of CHATGPT_MODEL_SELECTOR_BUTTONS) {
             const loc = page.locator(selector).first();
             if (!(await loc.isVisible().catch(() => false))) continue;
-            await loc.click({ timeout: 5_000 });
+            await loc.click({ timeout: 5_000, noWaitAfter: true });
             await page.waitForTimeout(400).catch(() => undefined);
             if (await isModelMenuOpen(page)) {
                 await assertOpenMenuIsNotWorkPicker(page);
@@ -836,7 +831,7 @@ async function openModelMenu(page, usedFallbacks) {
         const composerPill = await findComposerModelPill(page);
         if (composerPill) {
             usedFallbacks.push('composer-model-pill');
-            await composerPill.click({ timeout: 5_000 });
+            await composerPill.click({ timeout: 5_000, noWaitAfter: true });
             await page.waitForTimeout(400).catch(() => undefined);
             if (await isModelMenuOpen(page)) {
                 await assertOpenMenuIsNotWorkPicker(page);
@@ -848,7 +843,7 @@ async function openModelMenu(page, usedFallbacks) {
     usedFallbacks.push('model-menu-text-button');
     const textButton = await findModelTextButton(page);
     if (textButton && await textButton.isVisible().catch(() => false)) {
-        await textButton.click({ timeout: 5_000 });
+        await textButton.click({ timeout: 5_000, noWaitAfter: true });
         await page.waitForTimeout(400).catch(() => undefined);
         if (await isModelMenuOpen(page)) {
             await assertOpenMenuIsNotWorkPicker(page);
@@ -879,7 +874,10 @@ async function findComposerModelPill(page) {
             if (!(await loc.isVisible().catch(() => false))) continue;
             const text = await loc.innerText({ timeout: 1_000 }).catch(() => '');
             const trimmed = text.trim();
-            if (!isModelPillText(trimmed)) continue;
+            const popup = await loc.getAttribute('aria-haspopup').catch(() => null);
+            const classes = await loc.getAttribute('class').catch(() => '');
+            if (!isModelPillText(trimmed)
+                && !(popup === 'menu' && String(classes).split(/\s+/).includes('__composer-pill') && trimmed)) continue;
             if (isStandaloneEffortLabel(trimmed)) {
                 if (!standaloneEffort) standaloneEffort = loc;
                 continue;
@@ -897,9 +895,10 @@ async function findComposerModelPill(page) {
 async function findModelTextButton(page) {
     /** @type {Locator | null} */
     let standaloneEffort = null;
-    const candidates = await page.locator('button').count().catch(() => 0);
+    const buttons = page.locator('form button, form [role="button"]');
+    const candidates = await buttons.count().catch(() => 0);
     for (let index = candidates - 1; index >= 0; index -= 1) {
-        const loc = page.locator('button').nth(index);
+        const loc = buttons.nth(index);
         if (!(await loc.isVisible().catch(() => false))) continue;
         const text = (await loc.innerText({ timeout: 500 }).catch(() => '')).trim();
         if (!isModelPillText(text)) continue;
@@ -931,6 +930,10 @@ function chatGptComposerMenuRoot(page) {
 async function isChatGptPowerPickerOpen(page) {
     const root = page.locator(CHATGPT_POWER_PICKER_ROOT_SELECTOR).last();
     if (!(await root.isVisible().catch(() => false))) return false;
+    if (await root.locator('[role="slider"]').first().isVisible().catch(() => false)) {
+        const labelledby = await root.getAttribute('aria-labelledby').catch(() => null);
+        if (labelledby && await page.locator(`form [id=${JSON.stringify(labelledby)}]`).isVisible().catch(() => false)) return true;
+    }
     const power = root.locator('[role="menuitem"][aria-label="Power"]').first();
     if (!(await power.isVisible().catch(() => false))) return false;
     const triggers = await root.locator('[role="menuitem"][data-has-submenu]').all()
@@ -971,9 +974,11 @@ async function findPowerPickerSubmenuTrigger(page, heading) {
  * @returns {Promise<boolean>}
  */
 async function openPowerPickerSubmenu(page, heading) {
+    if (heading !== 'Model') familyMenuOwners.delete(page);
     if (await isPowerSubmenuPortalOpen(page, heading)) return true;
     const trigger = await findPowerPickerSubmenuTrigger(page, heading);
     if (!trigger) return false;
+    if (heading === 'Model') await rememberFamilyMenuOwner(page, trigger);
     // Live, the submenu rows are pointer-intercepted until the shell's "Advanced"
     // toggle is expanded, so a plain click times out. Swallowing that timeout and
     // returning true made callers believe a portal opened when none did. Ladder:
@@ -988,7 +993,7 @@ async function openPowerPickerSubmenu(page, heading) {
     await page.keyboard.press('ArrowRight').catch(() => undefined);
     await page.waitForTimeout(300).catch(() => undefined);
     if (await isPowerSubmenuPortalOpen(page, heading)) return true;
-    await trigger.click({ timeout: 2_000, force: true }).catch(() => undefined);
+    await trigger.click({ timeout: 2_000, force: true, noWaitAfter: true }).catch(() => undefined);
     await page.waitForTimeout(300).catch(() => undefined);
     if (await isPowerSubmenuPortalOpen(page, heading)) return true;
     // A forced click can tear the shell down. Never leave the picker half-open:
@@ -1010,8 +1015,19 @@ async function openPowerPickerSubmenu(page, heading) {
 async function expandPowerPickerAdvanced(page) {
     const collapsed = page.locator('[role="menuitem"][aria-label="Show advanced options"]').first();
     if (!(await collapsed.isVisible().catch(() => false))) return;
-    await collapsed.click({ timeout: 2_000, force: true }).catch(() => undefined);
+    await collapsed.click({ timeout: 2_000, force: true, noWaitAfter: true }).catch(() => undefined);
     await page.waitForTimeout(400).catch(() => undefined);
+}
+
+async function rememberFamilyMenuOwner(page, trigger) {
+    const before = await page.locator('[role="menu"][data-state="open"]').all().catch(() => []);
+    const ids = [];
+    for (const menu of before) ids.push(await menu.getAttribute('id').catch(() => null));
+    familyMenuOwners.set(page, {
+        triggerId: await trigger.getAttribute('id').catch(() => null),
+        controls: await trigger.getAttribute('aria-controls').catch(() => null),
+        before: ids,
+    });
 }
 
 /**
@@ -1099,8 +1115,7 @@ const CHATGPT_POWER_STOP_EFFORT = Object.freeze({
  * @returns {EffortChoice|null}
  */
 export function effortChoiceFromPowerTierLabel(label, index) {
-    const firstLine = String(label || '').split(/\r?\n/)[0] || '';
-    const stripped = firstLine.replace(/,\s*\d+\s+of\s+\d+\.?$/i, '').trim();
+    const stripped = String(label || '').split(/\r?\n/).map(line => line.replace(/[,，].*$/, '').trim()).join('\n');
     /** @type {EffortChoice|null} */
     let fromLabel = null;
     for (const effort of /** @type {EffortChoice[]} */ (['medium', 'high', 'xhigh'])) {
@@ -1109,12 +1124,8 @@ export function effortChoiceFromPowerTierLabel(label, index) {
             break;
         }
     }
-    const hasIndex = Number.isFinite(index);
-    const fromIndex = hasIndex
-        ? (CHATGPT_POWER_STOP_EFFORT[/** @type {number} */ (index)] ?? null)
-        : null;
-    if (fromLabel && hasIndex) return fromLabel === fromIndex ? fromLabel : null;
-    return fromLabel || fromIndex;
+    // aria-valuenow has no version-independent semantic meaning.
+    return fromLabel;
 }
 
 /**
@@ -1122,10 +1133,12 @@ export function effortChoiceFromPowerTierLabel(label, index) {
  * @returns {ModelChoice|null}
  */
 function modelChoiceFromPowerSimpleText(text) {
-    const first = String(text || '').split(/\r?\n/)[0] || '';
-    // "High, 3 of 5." / "Pro, 5 of 5."
-    const label = first.replace(/,\s*\d+\s+of\s+\d+\.?$/i, '').trim();
-    return modelChoiceFromPowerTierText(label) || modelChoiceFromText(label);
+    for (const line of String(text || '').split(/\r?\n/)) {
+        const label = line.replace(/[,，].*$/, '').trim();
+        const choice = modelChoiceFromPowerTierText(label) || modelChoiceFromText(label);
+        if (choice) return choice;
+    }
+    return null;
 }
 
 /**
@@ -1134,9 +1147,15 @@ function modelChoiceFromPowerSimpleText(text) {
  */
 async function readChatGptPowerSliderState(page) {
     const simple = page.locator('[data-testid="composer-model-picker-slider-simple-view"]').first();
-    const simpleText = typeof simple?.innerText === 'function'
+    let simpleText = typeof simple?.innerText === 'function'
         ? (await simple.innerText({ timeout: 500 }).catch(() => '')).trim()
         : '';
+    if (!simpleText) {
+        const root = chatGptComposerMenuRoot(page);
+        // Current compact picker: its first menuitem displays version + tier;
+        // family radios below it are separate. Do not infer tier from position.
+        simpleText = (await root.locator('[role="menuitem"]').first().innerText({ timeout: 500 }).catch(() => '')).trim();
+    }
     const choiceFromSimple = modelChoiceFromPowerSimpleText(simpleText);
     const slider = page.locator(
         '[data-testid="composer-model-picker-slider-simple-view"] [role="slider"], [role="menu"][data-state="open"] [role="slider"]',
@@ -1145,14 +1164,11 @@ async function readChatGptPowerSliderState(page) {
         ? await slider.getAttribute('aria-valuenow').catch(() => null)
         : null;
     const index = nowStr != null && nowStr !== '' ? Number(nowStr) : null;
+    const valueText = typeof slider?.getAttribute === 'function'
+        ? await slider.getAttribute('aria-valuetext').catch(() => null) : null;
+    const fromValueText = valueText ? modelChoiceFromPowerSimpleText(valueText) : null;
+    if (fromValueText) return { index: Number.isFinite(index) ? index : null, choice: fromValueText, label: valueText };
     if (choiceFromSimple) return { index: Number.isFinite(index) ? index : null, choice: choiceFromSimple, label: simpleText || choiceFromSimple };
-    if (Number.isFinite(index)) {
-        /** @type {ModelChoice[]} */
-        const byIndex = ['instant', 'thinking', 'thinking', 'thinking', 'pro'];
-        // 0 Instant, 1 Medium, 2 High, 3 Extra High, 4 Pro. Medium/High/xhigh all map to thinking.
-        const mapped = byIndex[/** @type {number} */ (index)] || null;
-        return { index: /** @type {number} */ (index), choice: mapped, label: simpleText || mapped };
-    }
     const effortTrigger = await findPowerPickerSubmenuTrigger(page, 'Effort');
     if (effortTrigger) {
         const text = (await effortTrigger.innerText({ timeout: 500 }).catch(() => '')).trim();
@@ -1190,42 +1206,34 @@ async function selectChatGptPowerTierBySlider(page, choice, options = {}) {
     if (!(await isChatGptPowerPickerOpen(page))) return false;
     const effort = options.effort || null;
     const usedFallbacks = options.usedFallbacks || [];
-    const targetIndex = powerTierIndexForChoice(choice, effort);
-    const power = page.locator('[role="menuitem"][aria-label="Power"]').first();
+    let power = chatGptComposerMenuRoot(page).locator('[role="slider"]').first();
+    if (!(await power.isVisible().catch(() => false))) power = page.locator('[role="menuitem"][aria-label="Power"]').first();
     if (!(await power.isVisible().catch(() => false))) return false;
     await power.focus({ timeout: 1_000 }).catch(() => undefined);
-    await power.click({ timeout: 2_000 }).catch(() => undefined);
+    await power.click({ timeout: 2_000, noWaitAfter: true }).catch(() => undefined);
     await page.waitForTimeout(150).catch(() => undefined);
-    let stagnant = 0;
-    let previousIndex = null;
-    for (let attempt = 0; attempt < 8; attempt += 1) {
+    const matches = state => state.choice === choice
+        && (choice !== 'thinking' || !effort || effortChoiceFromPowerTierLabel(state.label, state.index) === effort);
+    if (matches(await readChatGptPowerSliderState(page))) return true;
+    // Traverse labelled stops, not an assumed five-stop model ordering.
+    // Home + arrows are the slider's own interaction contract. Stop on no
+    // progress or a repeated state; the bound protects malformed controls.
+    await page.keyboard.press('Home');
+    const visited = new Set();
+    for (let attempt = 0; attempt < 32; attempt += 1) {
         const state = await readChatGptPowerSliderState(page);
-        if (state.choice === choice) {
-            // For thinking, also honor the requested effort stop when known.
-            if (choice !== 'thinking' || effort == null || state.index == null || state.index === targetIndex) {
-                usedFallbacks.push('chat-power-slider');
-                return true;
-            }
-        }
-        const currentIndex = state.index != null ? state.index : (
-            state.choice === 'instant' ? 0
-                : state.choice === 'pro' ? 4
-                    : 2
-        );
-        if (currentIndex === targetIndex && state.choice === choice) {
+        if (matches(state)) {
             usedFallbacks.push('chat-power-slider');
             return true;
         }
-        if (previousIndex != null && previousIndex === currentIndex) stagnant += 1;
-        else stagnant = 0;
-        previousIndex = currentIndex;
-        if (stagnant >= 2) break;
-        const key = currentIndex > targetIndex ? 'ArrowLeft' : 'ArrowRight';
-        await page.keyboard.press(key).catch(() => undefined);
+        const signature = JSON.stringify([state.index, state.label]);
+        if (visited.has(signature)) break;
+        visited.add(signature);
+        await page.keyboard.press('ArrowRight');
         await page.waitForTimeout(250).catch(() => undefined);
     }
     const finalState = await readChatGptPowerSliderState(page);
-    if (finalState.choice === choice) {
+    if (matches(finalState)) {
         usedFallbacks.push('chat-power-slider');
         return true;
     }
@@ -1293,6 +1301,7 @@ async function findModelOption(page, choice) {
  */
 async function openSimplifiedIntelligenceSubmenu(page, options = {}) {
     const forceFamily = options.forceFamily === true;
+    if (forceFamily && await findOpenFamilySubmenu(page, [])) return;
     if (!forceFamily && await isSimplifiedIntelligenceMenuOpen(page, null, null)) return;
     const familyLabels = Object.values(CHATGPT_FAMILY_OPTIONS).map(option => option.label);
     if (forceFamily && await isChatGptPowerPickerOpen(page)) {
@@ -1315,7 +1324,10 @@ async function openSimplifiedIntelligenceSubmenu(page, options = {}) {
         const loc = candidates.nth(index);
         if (!(await loc.isVisible().catch(() => false))) continue;
         const text = (await loc.innerText({ timeout: 500 }).catch(() => '')).trim();
-        if (!familyLabels.some(label => menuTextHasExactLine(text, label))) continue;
+        const ariaLabel = await loc.getAttribute('aria-label').catch(() => '');
+        if (forceFamily ? !/^(Model|모델|模型)(?:\s|$)/i.test(`${ariaLabel || ''} ${text}`.trim())
+            : !familyLabels.some(label => menuTextHasExactLine(text, label))) continue;
+        if (forceFamily) await rememberFamilyMenuOwner(page, loc);
         await loc.hover({ timeout: 1_000 }).catch(() => undefined);
         await page.waitForTimeout(150).catch(() => undefined);
         if (forceFamily
@@ -1357,28 +1369,32 @@ async function isModelOptionCandidate(loc, choice) {
  * @returns {Promise<FamilySelectionEvidence>}
  */
 async function selectChatGptFamily(page, family) {
-    const expected = CHATGPT_FAMILY_OPTIONS[family]?.label;
-    if (!expected) throw familyMismatch(family, null);
-    const familyLabels = Object.values(CHATGPT_FAMILY_OPTIONS).map(option => option.label);
     await openSimplifiedIntelligenceSubmenu(page, { forceFamily: true });
     const before = await readVisibleChatGptFamilyEvidence(page);
-    const submenu = await findOpenFamilySubmenu(page, familyLabels);
-    if (!submenu) throw familyMismatch(family, expected);
+    const submenu = await findOpenFamilySubmenu(page, []);
+    if (!submenu) throw familyMismatch(family, null);
     const rows = await submenu.locator('[role="menuitemradio"]').all()
         .catch(() => /** @type {Locator[]} */ ([]));
     let option = null;
+    let expected = null;
+    const available = [];
     for (const row of rows) {
+        if (!(await row.isVisible().catch(() => false))) continue;
         const text = (await row.innerText({ timeout: 500 }).catch(() => '')).trim();
-        if (menuTextHasExactLine(text, expected)) {
+        const label = text.split(/\r?\n/)[0].trim();
+        available.push(label);
+        if (normalizeChatGptFamilyChoice(label) === family) {
+            if (option) throw familyMismatch(family, 'ambiguous UI family');
             option = row;
-            break;
+            expected = label;
         }
     }
-    if (!option) throw familyMismatch(family, expected);
+    if (!option) throw new WebAiError({ errorCode: 'provider.model-mismatch', stage: 'provider-select-mode', vendor: 'chatgpt', retryHint: 'use-available-family', message: `ChatGPT family ${family} is not present in this account's Model menu`, evidence: { requestedFamily: family, availableFamilies: available } });
     const changed = !(before?.verified && before.label === expected);
     if (changed) {
-        await option.click({ timeout: 5_000 });
+        await option.click({ timeout: 5_000, noWaitAfter: true });
         await page.waitForTimeout(400).catch(() => undefined);
+        await openModelMenu(page, []);
         await openSimplifiedIntelligenceSubmenu(page, { forceFamily: true });
     }
     const after = await readVisibleChatGptFamilyEvidence(page);
@@ -1393,6 +1409,7 @@ async function selectChatGptFamily(page, family) {
  * @returns {Promise<Locator | null>}
  */
 async function findOpenFamilySubmenu(page, familyLabels) {
+    const inferred = [];
     const menus = await page.locator('[role="menu"][data-state="open"]').all()
         .catch(() => /** @type {Locator[]} */ ([]));
     for (let index = menus.length - 1; index >= 0; index -= 1) {
@@ -1407,9 +1424,25 @@ async function findOpenFamilySubmenu(page, familyLabels) {
             const text = (await row.innerText({ timeout: 500 }).catch(() => '')).trim();
             visibleTexts.push(text);
         }
-        if (familyLabels.every(label => visibleTexts.some(text => menuTextHasExactLine(text, label)))) return menu;
+        if (!visibleTexts.length) continue;
+        const owner = familyMenuOwners.get(page);
+        const id = await menu.getAttribute('id').catch(() => null);
+        const labelledby = await menu.getAttribute('aria-labelledby').catch(() => null);
+        if (owner && ((owner.controls && id === owner.controls)
+            || (owner.triggerId && labelledby === owner.triggerId))) return menu;
+        if (owner && id && !owner.before.includes(id)) inferred.push(menu);
+        // A submenu already open on attach may still expose its owner.
+        if (labelledby) {
+            const composerTrigger = page.locator(`form [id=${JSON.stringify(labelledby)}]`);
+            const hasSlider = await menu.locator('[role="slider"]').first().isVisible().catch(() => false);
+            const familyRows = visibleTexts.every(text => !modelChoiceFromPowerTierText(text.split(/\r?\n/)[0]));
+            if (hasSlider && familyRows && await composerTrigger.isVisible().catch(() => false)) return menu;
+            const trigger = chatGptComposerMenuRoot(page).locator(`[id=${JSON.stringify(labelledby)}]`).first();
+            const heading = (await trigger.innerText({ timeout: 500 }).catch(() => '')).trim();
+            if (/^(Model|모델|模型)(?:\s|$)/i.test(heading)) return menu;
+        }
     }
-    return null;
+    return inferred.length === 1 ? inferred[0] : null;
 }
 
 /**
@@ -1425,12 +1458,14 @@ async function readVisibleChatGptFamilyEvidence(page) {
             '[role="menuitemradio"][aria-checked="true"], '
             + '[role="menuitemradio"][data-state="checked"]',
         ).all().catch(() => /** @type {Locator[]} */ ([]));
+        const checkedLabels = [];
         for (const row of checkedRows) {
             if (!(await hasConsistentCheckedState(row))) continue;
             const text = (await row.innerText({ timeout: 500 }).catch(() => '')).trim();
-            const label = familyLabels.find(candidate => menuTextHasExactLine(text, candidate));
-            if (label) return { label, changed: false, verified: true };
+            const label = text.split(/\r?\n/)[0].trim();
+            if (label) checkedLabels.push(label);
         }
+        if (checkedLabels.length === 1) return { label: checkedLabels[0], changed: false, verified: true };
     }
     const root = chatGptComposerMenuRoot(page);
     if (await root.isVisible().catch(() => false)) {
@@ -1438,7 +1473,8 @@ async function readVisibleChatGptFamilyEvidence(page) {
             .catch(() => /** @type {Locator[]} */ ([]));
         for (const trigger of triggers) {
             const text = (await trigger.innerText({ timeout: 500 }).catch(() => '')).trim();
-            const label = familyLabels.find(candidate => menuTextHasExactLine(text, candidate));
+            const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+            const label = /^(Model|모델|模型)$/i.test(lines[0] || '') ? lines[1] : null;
             if (label) return { label, changed: false, verified: false };
         }
     }
@@ -2254,8 +2290,6 @@ function escapeRegExp(value) {
  * @returns {Promise<boolean>}
  */
 async function isChatGptFamilyOptionAvailable(page, family) {
-    const expected = CHATGPT_FAMILY_OPTIONS[family]?.label;
-    if (!expected) return false;
     const familyLabels = Object.values(CHATGPT_FAMILY_OPTIONS).map(option => option.label);
     await openSimplifiedIntelligenceSubmenu(page, { forceFamily: true }).catch(() => undefined);
     const submenu = await findOpenFamilySubmenu(page, familyLabels);
@@ -2263,7 +2297,7 @@ async function isChatGptFamilyOptionAvailable(page, family) {
     const rows = await submenu.locator('[role="menuitemradio"]').all().catch(() => /** @type {Locator[]} */ ([]));
     for (const row of rows) {
         const text = (await row.innerText({ timeout: 500 }).catch(() => '')).trim();
-        if (!menuTextHasExactLine(text, expected)) continue;
+        if (normalizeChatGptFamilyChoice(text.split(/\r?\n/)[0]) !== family) continue;
         if (typeof row.isVisible === 'function' && !(await row.isVisible().catch(() => false))) continue;
         if (typeof row.isEnabled === 'function' && !(await row.isEnabled().catch(() => false))) continue;
         return true;

@@ -58,9 +58,7 @@ describe('web-ai MCP server', () => {
         expect(getPageCalls).toBe(0);
     });
 
-    it('rejects an unsupported family alias at the schema boundary', async () => {
-        // Regression guard for existing behavior: the enum stops bad aliases
-        // before the handler, so the handler only ever sees valid ones.
+    it('rejects a non-string family before the handler reaches the browser', async () => {
         let getPageCalls = 0;
         const deps = {
             getPage: async () => { getPageCalls += 1; return fakePage(); },
@@ -73,7 +71,7 @@ describe('web-ai MCP server', () => {
             method: 'tools/call',
             params: {
                 name: 'web_ai_submit_prompt',
-                arguments: { provider: 'chatgpt', family: 'gpt-5.6-luna', prompt: 'hello' },
+                arguments: { provider: 'chatgpt', family: 42, prompt: 'hello' },
             },
         }, deps);
 

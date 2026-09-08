@@ -267,10 +267,10 @@ describe('web-ai ChatGPT model selector policy', () => {
         });
     });
 
-    it.each(['Pro', 'Standard Pro', 'Extended Pro'])('vetoes Sol when the final composer pill is %s', async composerProPillLabel => {
+    it.each(['Pro', 'Standard Pro', 'Extended Pro'])('verifies Sol and Pro independently with composer pill %s', async composerProPillLabel => {
         const { selectChatGptModel } = await import('../../web-ai/chatgpt-model.mjs');
         const page = createFakeModelPage({
-            model: 'thinking',
+            model: 'pro',
             family: 'gpt-5.5',
             composerProPillLabel,
             simplifiedIntelligenceMenu: true,
@@ -279,10 +279,9 @@ describe('web-ai ChatGPT model selector policy', () => {
             roleButtonPill: true,
         });
 
-        await expect(selectChatGptModel(page, undefined, { family: 'gpt-5.6-sol' })).rejects.toMatchObject({
-            errorCode: 'provider.model-mismatch',
-            stage: 'provider-select-mode',
-            evidence: { activeComposerLabel: composerProPillLabel },
+        await expect(selectChatGptModel(page, 'pro', { family: 'gpt-5.6-sol' })).resolves.toMatchObject({
+            selected: 'pro',
+            modelSelection: { verified: true, familyLabel: 'GPT-5.6 Sol' },
         });
     });
 
@@ -793,7 +792,7 @@ describe('web-ai ChatGPT model selector policy', () => {
         });
     });
 
-    it('falls back to the current ChatGPT model when the model picker disappears and no effort is requested', async () => {
+    it('reports an unavailable model instead of claiming the request was already selected', async () => {
         const { selectChatGptModel } = await import('../../web-ai/chatgpt-model.mjs');
         const clock = useAdvancingClock();
         try {
@@ -808,7 +807,7 @@ describe('web-ai ChatGPT model selector policy', () => {
         expect(result).toMatchObject({
             requested: 'thinking',
             selected: null,
-            alreadySelected: true,
+            alreadySelected: false,
             warnings: [expect.stringContaining('requested thinking was not enforced')],
         });
         expect(result.usedFallbacks).toContain('model-selector-unavailable-current-model');
@@ -817,7 +816,7 @@ describe('web-ai ChatGPT model selector policy', () => {
         }
     });
 
-    it('keeps sending when the model picker disappears with reasoning effort and reports the unenforced canonical effort', async () => {
+    it('reports unverified effort when the picker disappears so the sender can refuse submission', async () => {
         const { selectChatGptModel } = await import('../../web-ai/chatgpt-model.mjs');
         const clock = useAdvancingClock();
         try {
@@ -882,7 +881,7 @@ describe('web-ai ChatGPT model selector policy', () => {
 // #87: `--family` reached the selector but never the capability probe, so a
 // probe `ok` was mistaken for proof that the requested family was enforced.
 describe('capability probe family contract (#87)', () => {
-    it.each(['gpt-5.4', 'gpt-5.3'])('rejects retired Chat family %s before touching the menu', async family => {
+    it.each(['gpt-5.4', 'gpt-5.3'])('rejects absent family %s based on the actual menu, not a release allowlist', async family => {
         const { chatGptModelCapabilityProbe } = await import('../../web-ai/chatgpt-model.mjs');
         const clock = useAdvancingClock();
         try {
@@ -898,13 +897,13 @@ describe('capability probe family contract (#87)', () => {
 
             await expect(chatGptModelCapabilityProbe(watched, 'thinking', { family }))
                 .resolves.toMatchObject({ state: 'fail', evidence: { family } });
-            expect(touched).toBe(0);
+            expect(touched).toBeGreaterThan(0);
         } finally {
             clock.restore();
         }
     });
 
-    it('fails an unsupported family before touching the menu', async () => {
+    it('checks the UI before rejecting an unavailable family', async () => {
         const { chatGptModelCapabilityProbe } = await import('../../web-ai/chatgpt-model.mjs');
         const page = createFakeModelPage({ simplifiedIntelligenceMenu: true });
         let touched = 0;
@@ -918,7 +917,7 @@ describe('capability probe family contract (#87)', () => {
 
         await expect(chatGptModelCapabilityProbe(watched, 'thinking', { family: 'gpt-5.6-luna' }))
             .resolves.toMatchObject({ state: 'fail', evidence: { family: 'gpt-5.6-luna' } });
-        expect(touched).toBe(0);
+        expect(touched).toBeGreaterThan(0);
     });
 
     it('fails an explicit unsupported model even when the family is valid', async () => {
@@ -1167,6 +1166,7 @@ function createFakeModelPage({
         checked: true,
     }));
     const familyTrigger = createElement({
+        attributes: { id: 'family-trigger', 'aria-label': 'Model', 'aria-controls': 'family-menu' },
         text: () => powerPickerShell
             ? `Model\n${familyLabels[state.currentFamily]}`
             : familyLabels[state.currentFamily],
@@ -1263,6 +1263,7 @@ function createFakeModelPage({
                     const next = Math.max(0, Math.min(4, state.sliderIndex + (key === 'ArrowRight' ? 1 : -1)));
                     applyPowerStop(next);
                 }
+                if (powerSliderStops && key === 'Home' && state.sliderFocused && !powerSliderFrozen) applyPowerStop(0);
             },
         },
         mouse: {
@@ -1387,6 +1388,7 @@ function createFakeModelPage({
     }
     function familyPortalRoot() {
         return createElement({
+            attributes: { id: 'family-menu', 'aria-labelledby': 'family-trigger' },
             text: () => familyRows.map(row => row.text).join('\n'),
             selectChildren: selector => {
             if (selector === '[role="menuitemradio"], [role="menuitem"]') return familyRows;
@@ -1426,6 +1428,12 @@ function createFakeModelPage({
     }
 
     function selectElements(selector) {
+        // This double models only composer controls. Production now scopes
+        // them to the form instead of scanning profile/message buttons.
+        selector = selector.replace(/(^|,\s*)form /g, '$1');
+        if (powerPickerShell && selector.includes('[role="menu"]') && selector.includes('aria-label="Power"')) {
+            return state.modelMenuOpen ? [powerShellRoot()] : [];
+        }
         if (modelPickerUnavailable) return [];
         if (selector === 'button, [role="button"], [role="menuitem"]') return state.modelMenuOpen && !state.effortMenuOpen && state.genericEffortTrigger && genericTriggerMode === 'text' ? [...composerPills(), genericTrigger] : composerPills();
         if (selector.includes('[role="button"].__composer-pill')) return roleButtonPill ? composerPills() : [];
@@ -1507,7 +1515,7 @@ function createFakeModelPage({
             // trigger has been interacted with. Gating it here is what makes the
             // family assertions fail if the selector code stops opening it.
             return state.modelMenuOpen && state.familySubmenuOpen
-                ? [createElement({ text: familyRows.map(row => row.text).join('\n') })]
+                ? [familyPortalRoot()]
                 : [];
         }
         if (selector === '[role="menuitem"][data-has-submenu]') {
@@ -1661,7 +1669,7 @@ describe('Power tier contract (260818 live repair)', () => {
     // where Medium/High/Extra High all collapse to 'thinking'.
     const src = readFileSync(join(process.cwd(), 'web-ai/chatgpt-model.mjs'), 'utf8');
 
-    it('maps Power slider stops to thinking efforts and fails closed on disagreement', async () => {
+    it('reads effort labels without assigning semantics to slider indexes', async () => {
         const { effortChoiceFromPowerTierLabel } = await import('../../web-ai/chatgpt-model.mjs');
 
         expect(effortChoiceFromPowerTierLabel('Medium, 2 of 5.', 1)).toBe('medium');
@@ -1670,11 +1678,11 @@ describe('Power tier contract (260818 live repair)', () => {
         // Instant and Pro are not thinking stops.
         expect(effortChoiceFromPowerTierLabel('Instant, 1 of 5.', 0)).toBeNull();
         expect(effortChoiceFromPowerTierLabel('Pro, 5 of 5.', 4)).toBeNull();
-        // One source is enough when the other is absent.
+        // Labels identify the effort; numeric positions alone do not.
         expect(effortChoiceFromPowerTierLabel('High, 3 of 5.', null)).toBe('high');
-        expect(effortChoiceFromPowerTierLabel(null, 3)).toBe('xhigh');
-        // Disagreement must not be resolved by guessing.
-        expect(effortChoiceFromPowerTierLabel('Medium, 2 of 5.', 3)).toBeNull();
+        expect(effortChoiceFromPowerTierLabel(null, 3)).toBeNull();
+        // A newly inserted stop must not invalidate the displayed effort.
+        expect(effortChoiceFromPowerTierLabel('Medium, 2 of 5.', 3)).toBe('medium');
         // The real shell string is multi-line; the tier is on the first line.
         expect(effortChoiceFromPowerTierLabel(
             'Extra High, 4 of 5.\nUse Left and Right arrow keys to adjust power.', 3,
@@ -1796,8 +1804,6 @@ describe('live Power shell 260818 (behavioral)', () => {
             expect(result.modelSelection.verified).toBe(false);
             expect(result.effort).toBeNull();
             expect(result.alreadySelected).toBe(false);
-            // Nothing moved and the control never answered, so the honest status is
-            // 'unavailable'. What matters is that neither success status is claimed.
             expect(result.modelSelection.status).toBe('unavailable');
             expect(['switched', 'already-selected']).not.toContain(result.modelSelection.status);
             expect(result.warnings).toContain('effort-selection-unverified');

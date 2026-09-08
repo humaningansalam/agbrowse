@@ -74,7 +74,7 @@ function poll(page, timeoutSec = 30) {
         { vendor: 'chatgpt', prompt: 'q', attachmentPolicy: 'inline-only' },
         {
             targetId: 'target-activity',
-            conversationUrl: 'https://chatgpt.com/c/activity',
+            conversationUrl: page.url(),
             deadlineAt: new Date(Date.now() + 600_000).toISOString(),
             envelopeSummary: { assistantCount: 0 },
         },

@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-09-03T03:57:46.293Z",
-  "total_mjs": 409,
+  "generated_at": "2026-09-08T00:35:20.280Z",
+  "total_mjs": 410,
   "fan_in": {
     "web-ai/session.mjs": 41,
     "web-ai/errors.mjs": 40,
@@ -8,24 +8,24 @@
     "web-ai/tab-recovery.mjs": 16,
     "web-ai/chatgpt.mjs": 14,
     "web-ai/session-artifacts.mjs": 14,
-    "web-ai/chatgpt-model.mjs": 12,
+    "web-ai/chatgpt-model.mjs": 13,
+    "web-ai/chatgpt-response-dom.mjs": 12,
     "skills/browser/adaptive-fetch/safety.mjs": 11,
     "test/helpers/exec-browser.mjs": 11,
-    "web-ai/chatgpt-response-dom.mjs": 11,
+    "test/helpers/temp-env.mjs": 10,
     "web-ai/active-command-store.mjs": 10,
     "web-ai/chatgpt-work-picker.mjs": 10,
     "web-ai/cli.mjs": 10,
     "web-ai/gemini-live.mjs": 10,
-    "test/helpers/temp-env.mjs": 9,
     "web-ai/grok-live.mjs": 9,
     "web-ai/vendor-editor-contract.mjs": 9,
+    "skills/browser/tab-manager.mjs": 8,
     "web-ai/chatgpt-composer.mjs": 8,
     "web-ai/constants.mjs": 8,
+    "web-ai/poll-deadline.mjs": 8,
     "skills/browser/runway-selectors.mjs": 7,
-    "skills/browser/tab-manager.mjs": 7,
     "web-ai/chatgpt-attachments.mjs": 7,
     "web-ai/copy-markdown.mjs": 7,
-    "web-ai/poll-deadline.mjs": 7,
     "web-ai/tab-finalizer.mjs": 7,
     "web-ai/tab-lease-store.mjs": 7,
     "skills/browser/adaptive-fetch/index.mjs": 6,
@@ -40,6 +40,8 @@
     "skills/browser/runway-download.mjs": 5,
     "skills/browser/runway-generate.mjs": 5,
     "skills/browser/runway-monitor.mjs": 5,
+    "test/integration/playwright-launch.mjs": 5,
+    "web-ai/ax-snapshot.mjs": 5,
     "web-ai/capability.mjs": 5,
     "web-ai/code-artifact.mjs": 5,
     "web-ai/context-pack/index.mjs": 5,
@@ -56,9 +58,7 @@
     "skills/browser/search-research/fetch-enrichment.mjs": 4,
     "skills/browser/search-research/normalizer.mjs": 4,
     "test/helpers/fixture-server.mjs": 4,
-    "test/integration/playwright-launch.mjs": 4,
     "web-ai/answer-artifact.mjs": 4,
-    "web-ai/ax-snapshot.mjs": 4,
     "web-ai/capability-observation-presets.mjs": 4,
     "web-ai/capability-types.mjs": 4,
     "web-ai/chatgpt-files.mjs": 4,
@@ -205,7 +205,7 @@
     "web-ai/active-command-store.mjs": 1,
     "web-ai/annotated-screenshot.mjs": 1,
     "web-ai/answer-artifact.mjs": 0,
-    "web-ai/ax-snapshot.mjs": 2,
+    "web-ai/ax-snapshot.mjs": 3,
     "web-ai/browser-primitives.mjs": 1,
     "web-ai/browser-tool-schema.mjs": 0,
     "web-ai/cache-metrics.mjs": 0,
@@ -522,6 +522,7 @@
     "test/integration/web-ai-mcp-server.test.mjs": 1,
     "test/integration/web-ai-policy-cli.test.mjs": 2,
     "test/integration/web-ai-policy-mcp.test.mjs": 3,
+    "test/integration/web-ai-target-and-model-evolution.test.mjs": 6,
     "test/integration/web-ai-trace-fixture.test.mjs": 1,
     "test/helpers/exec-browser.mjs": 1,
     "test/helpers/exec-script.mjs": 0,
@@ -824,6 +825,7 @@
     "test/integration/web-ai-mcp-server.test.mjs": 9,
     "test/integration/web-ai-policy-cli.test.mjs": 10,
     "test/integration/web-ai-policy-mcp.test.mjs": 9,
+    "test/integration/web-ai-target-and-model-evolution.test.mjs": 3,
     "test/integration/web-ai-trace-fixture.test.mjs": 10,
     "test/spec/antigravity-gap-tracking.test.mjs": 0,
     "test/spec/antigravity-security-contracts.test.mjs": 0,
@@ -1150,7 +1152,8 @@
     "web-ai/answer-artifact.mjs": [],
     "web-ai/ax-snapshot.mjs": [
       "web-ai/dom-hash.mjs",
-      "web-ai/errors.mjs"
+      "web-ai/errors.mjs",
+      "web-ai/poll-deadline.mjs"
     ],
     "web-ai/browser-primitives.mjs": [
       "web-ai/post-action-assert.mjs"
@@ -2355,6 +2358,14 @@
       "test/helpers/temp-env.mjs",
       "web-ai/active-command-store.mjs",
       "web-ai/mcp-server.mjs"
+    ],
+    "test/integration/web-ai-target-and-model-evolution.test.mjs": [
+      "skills/browser/tab-manager.mjs",
+      "test/helpers/temp-env.mjs",
+      "test/integration/playwright-launch.mjs",
+      "web-ai/ax-snapshot.mjs",
+      "web-ai/chatgpt-model.mjs",
+      "web-ai/chatgpt-response-dom.mjs"
     ],
     "test/integration/web-ai-trace-fixture.test.mjs": [
       "web-ai/cli.mjs"

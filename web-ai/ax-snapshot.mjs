@@ -3,6 +3,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { domHashAround } from './dom-hash.mjs';
 import { WebAiError } from './errors.mjs';
+import { withPollDeadline } from './poll-deadline.mjs';
 
 /**
  * @typedef {{
@@ -94,6 +95,7 @@ export const DEFAULT_INTERACTIVE_ROLES = new Set([
  *   redactText?: boolean,
  *   includeDomHash?: boolean,
  *   domHashMaxChars?: number,
+ *   timeoutMs?: number,
  * }} [options]
  * @returns {Promise<WebAiSnapshot>}
  */
@@ -107,7 +109,9 @@ export async function buildWebAiSnapshot(page, {
     redactText = false,
     includeDomHash = true,
     domHashMaxChars = 32768,
+    timeoutMs = 10_000,
 } = {}) {
+    return withPollDeadline(async () => {
     const tree = await captureAccessibilitySnapshot(page, { interactiveOnly, rootSelector });
     const serialized = serializeAxTree(tree, { compact, maxDepth, refPrefix, redactText });
     const domHash = includeDomHash
@@ -128,6 +132,17 @@ export async function buildWebAiSnapshot(page, {
             tokenEstimate: estimateSnapshotTokens(text),
         },
     };
+    }, {
+        timeoutMs,
+        onExpired: () => {
+            throw new WebAiError({
+                errorCode: 'cdp.unreachable', stage: 'snapshot',
+                retryHint: 'retry-same-session', mutationAllowed: false,
+                message: 'The bound page did not answer the snapshot request before its deadline',
+                evidence: { timeoutMs },
+            });
+        },
+    });
 }
 
 /** @param {string} snapshotText */

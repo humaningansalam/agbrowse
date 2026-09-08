@@ -65,11 +65,10 @@ describe('web-ai MCP tool schema', () => {
         expect(schema.inputSchema.properties.surface.enum).toEqual(['chat']);
     });
 
-    it('web_ai_submit_prompt has family enum with three canonical aliases', () => {
+    it('web_ai_submit_prompt discovers family availability in the UI rather than a release enum', () => {
         const schema = toolSchemaForMcp('web_ai_submit_prompt');
-        expect(schema.inputSchema.properties.family.enum).toEqual([
-            'gpt-5.6-sol', 'gpt-5.5', 'o3',
-        ]);
+        expect(schema.inputSchema.properties.family.enum).toBeUndefined();
+        expect(schema.inputSchema.properties.family).toMatchObject({ type: 'string', minLength: 1, maxLength: 128 });
     });
 
     it('web_ai_submit_prompt effort enum includes canonical and legacy aliases but not max/ultra', () => {
@@ -129,11 +128,11 @@ describe('web-ai MCP tool schema', () => {
         })).toThrow(/not in enum/);
     });
 
-    it('web_ai_submit_prompt rejects Work-only families', () => {
-        for (const family of ['gpt-5.6-terra', 'gpt-5.6-luna']) {
+    it('web_ai_submit_prompt accepts new family names for later Chat-menu verification', () => {
+        for (const family of ['latest', 'Nova 12 Orbit', 'gpt-6-astra']) {
             expect(() => validateWebAiToolInput('web_ai_submit_prompt', {
                 family, prompt: 'x',
-            })).toThrow(/not in enum/);
+            })).not.toThrow();
         }
     });
 

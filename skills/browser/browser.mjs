@@ -82,7 +82,7 @@ import { runWebAiCli } from '../../web-ai/cli.mjs';
 import { cleanupPoolTabs } from '../../web-ai/tab-pool.mjs';
 import { listActiveCommands } from '../../web-ai/active-command-store.mjs';
 import { enforcePolicy } from '../../web-ai/policy/enforce.mjs';
-import { createTab, closeTab, switchToTab, listManagedTabs } from './tab-manager.mjs';
+import { createTab, closeTab, switchToTab, listManagedTabs, getPageByTargetId } from './tab-manager.mjs';
 import { cleanupIdleTabs, planCleanupIdleTabs, pickCleanupCandidates, isPinned, parseDuration, DEFAULT_MAX_TABS } from './tab-lifecycle.mjs';
 import { runAdaptiveFetchCli } from './adaptive-fetch/index.mjs';
 import { runSearchCli } from './search.mjs';
@@ -1036,21 +1036,16 @@ async function closeBrowserViaCdp(port = getPort()) {
  * @param {any} port
  */
 async function getActivePage(port = getPort()) {
-    const { browser } = await connectCdp(port);
-    const pages = browser.contexts().flatMap((/** @type {any} */ c) => c.pages());
     const state = readPersistedState();
     const activeTargetId = state?.activeTargetId;
+    const tabs = await listTabs(port);
     if (activeTargetId) {
-        for (const page of pages) {
-            const pageTargetId = await getPageTargetId(page).catch(() => null);
-            if (pageTargetId === activeTargetId) return page;
-        }
-        const tabs = await listTabs(port).catch(() => []);
         if (tabs.some((/** @type {any} */ t) => t.id === activeTargetId)) {
-            throw new Error(`active target ${activeTargetId} is present in CDP but not attached as a Playwright page`);
+            return getPageByTargetId(port, activeTargetId);
         }
     }
-    return pages[pages.length - 1] || null;
+    const fallback = tabs.filter(t => t.type === 'page').at(0);
+    return fallback ? getPageByTargetId(port, fallback.id) : null;
 }
 
 /**
@@ -3664,7 +3659,7 @@ try {
         are never assigned to another session. Retention defaults: maxPerKey=3,
         globalMax=8, TTL=30m. Override via AGBROWSE_PROVIDER_POOL_MAX_PER_KEY,
         AGBROWSE_PROVIDER_POOL_GLOBAL_MAX, AGBROWSE_PROVIDER_POOL_TTL.
-        Active session caps default to per-key=5 and global=14. Override via
+        Active session counts are unlimited by default. Optional limits use
         AGBROWSE_PROVIDER_ACTIVE_MAX_PER_KEY and AGBROWSE_PROVIDER_ACTIVE_GLOBAL_MAX.
         Run tab-cleanup --json to inspect leaseClosedTabs.
 

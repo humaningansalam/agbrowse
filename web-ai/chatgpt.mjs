@@ -135,6 +135,9 @@ const STOPPED_RESPONSE_PATTERNS = [
     /^thinking stopped$/i,
     /^생각\s*중지됨$/,
     /^생각\s*중단됨$/,
+    /^생각\s*실패$/,
+    /^thinking failed$/i,
+    /^reasoning failed$/i,
 ];
 
 /**
@@ -373,6 +376,15 @@ export async function sendWebAi(deps, input = {}) {
         effort: input.reasoningEffort,
         family: input.family,
     });
+    if ((input.model || input.family || input.reasoningEffort)
+        && selectedModel?.modelSelection?.verified !== true) {
+        throw new WebAiError({
+            errorCode: 'provider.model-mismatch', stage: 'provider-select-mode', vendor: 'chatgpt',
+            retryHint: 'inspect-model-picker', mutationAllowed: false,
+            message: 'Requested model settings could not be verified; prompt was not submitted',
+            evidence: { promptSubmitted: false, modelSelection: selectedModel?.modelSelection || null, warnings: selectedModel?.warnings || [] },
+        });
+    }
 
     await waitForStableAssistantCount(page);
     const assistantCount = await countAssistantMessages(page);
@@ -734,6 +746,23 @@ async function readTargetIdentity(deps, session) {
         return { verdict: 'unknown', actualTargetId: null };
     }
     if (!actualTargetId) return { verdict: 'unknown', actualTargetId: null };
+    // A target can navigate after initial resolution. Recheck the durable
+    // conversation on every read, including timeout recovery, before using DOM.
+    const expectedConversationId = session.conversationId || extractConversationId(session.conversationUrl);
+    if (actualTargetId === session.targetId && expectedConversationId) {
+        let url;
+        try { url = (await deps.getPage()).url(); }
+        catch { return { verdict: 'unknown', actualTargetId }; }
+        const actualConversationId = extractConversationId(url);
+        if (actualConversationId !== expectedConversationId) {
+            throw new WebAiError({
+                errorCode: 'session.conversation-mismatch', stage: 'response-correlation',
+                vendor: 'chatgpt', retryHint: 'use-correct-session', mutationAllowed: false,
+                message: 'The bound target navigated to another conversation during polling',
+                evidence: { sessionId: session.sessionId, targetId: actualTargetId, expectedConversationId, actualConversationId },
+            });
+        }
+    }
     return {
         verdict: actualTargetId === session.targetId ? 'verified' : 'mismatch',
         actualTargetId,
@@ -1195,7 +1224,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         const correlatedSnapshots = [...correlatedWrapped, ...wrapperless]
             .sort((a, b) => (a.domOrder ?? 0) - (b.domOrder ?? 0));
         const stoppedSnapshot = correlatedSnapshots.at(-1) || null;
-        if (stoppedSnapshot && isStoppedAssistantResponse(stoppedSnapshot.text)) {
+        if (identityOk && stoppedSnapshot && isStoppedAssistantResponse(stoppedSnapshot.text)) {
             if (session && (stoppedSnapshot.messageId || stoppedSnapshot.turnId)
                 && (stoppedSnapshot.messageId !== responseMessageId || stoppedSnapshot.turnId !== responseTurnId)) {
                 const responseAnchor = await updateSessionForGeneration(session.sessionId, expectedGeneration, {
@@ -2622,7 +2651,7 @@ function extractConversationId(url) {
 
 /** @param {any} text */
 function isFinalAnswer(text) {
-    return !PLACEHOLDER_PATTERNS.some(pattern => pattern.test(text));
+    return !isStoppedAssistantResponse(text) && !PLACEHOLDER_PATTERNS.some(pattern => pattern.test(text));
 }
 
 /** @param {any} text */
