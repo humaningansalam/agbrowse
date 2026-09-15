@@ -25,23 +25,19 @@ describe('ChatGPT assistant response fragments', () => {
     });
 
     it('keeps sibling top-level assistant turns in order', () => {
-        const first = fakeNode('first answer');
-        const second = fakeNode('second answer');
-
-        const texts = withDocument({ [CHATGPT_ASSISTANT_SELECTORS[0]]: [first, second] }, () =>
-            readTopLevelAssistantTexts(CHATGPT_ASSISTANT_SELECTORS));
+        const texts = readSnapshotsFixture(`
+            <section data-testid="conversation-turn-2" data-turn="assistant"><div data-message-author-role="assistant">first answer</div></section>
+            <section data-testid="conversation-turn-4" data-turn="assistant"><div data-message-author-role="assistant">second answer</div></section>
+        `).map(snapshot => snapshot.text);
 
         expect(texts).toEqual(['first answer', 'second answer']);
     });
 
     it('baseline slicing still sees a new top-level answer after prior answers', () => {
-        const oldAnswer = fakeNode('old complete answer');
-        const newAnswer = fakeNode('new complete answer');
-        const nestedParagraph = fakeNode('new complete answer');
-        newAnswer.children.add(nestedParagraph);
-
-        const texts = withDocument({ [CHATGPT_ASSISTANT_SELECTORS[0]]: [oldAnswer, newAnswer, nestedParagraph] }, () =>
-            readTopLevelAssistantTexts(CHATGPT_ASSISTANT_SELECTORS));
+        const texts = readSnapshotsFixture(`
+            <section data-testid="conversation-turn-2" data-turn="assistant">old complete answer</section>
+            <section data-testid="conversation-turn-4" data-turn="assistant"><div data-message-author-role="assistant">new complete answer</div></section>
+        `).map(snapshot => snapshot.text);
 
         expect(texts.slice(1)).toEqual(['new complete answer']);
     });
@@ -271,6 +267,11 @@ function fakeLocator(node, nodesBySelector) {
 
 function withDocument(nodesBySelector, fn) {
     const previous = globalThis.document;
+    const ordered = Array.from(new Set(Object.values(nodesBySelector).flat()));
+    for (const node of ordered) {
+        node.compareDocumentPosition = other => node === other ? 0
+            : ordered.indexOf(node) < ordered.indexOf(other) ? 4 : 2;
+    }
     globalThis.document = {
         querySelectorAll: (selector) => nodesBySelector[selector] || [],
     };

@@ -40,7 +40,39 @@ as answers or treated as indefinite generation.
 Default active-session count limits are disabled. Explicitly configured legacy
 limits remain opt-in; no global agent queue or capacity controller was introduced.
 
+## Submission and answer evidence
+
+Chat submission records progress through `preparing` and `submitting`. `sent`
+is written only after the committed user message and durable conversation are
+bound to that generation. Upload paths are validated before creating a session
+or filling the composer. A failure before submit is an error; a lost submit
+acknowledgement is `submission-unknown`, not proof of failure or permission to
+send the same prompt again.
+
+Poll, watch and resume reject unfinished submissions with
+`session.submission-unverified` instead of reporting normal generation activity.
+This also rejects old orphan records marked `sent` on the provider home page.
+Durable legacy conversations remain readable. An uncertain submission can be
+inspected through the existing exact-session snapshot/status commands without
+implicitly resending or editing the session store.
+
+Response text comes from the identified message body, including multiple content
+blocks, rather than the turn's tool log or speaker heading. Completion controls
+are resolved in the same enclosing turn regardless of its HTML tag. Message IDs
+take precedence over renumbered turn indexes in both acquisition and completion.
+A speaker-only accessibility shell cannot displace a real answer.
+
+Sequential initial `send` calls can be followed by parallel `poll`/`watch` calls
+for different returned session IDs. No global queue or agent ownership registry
+is required or added by this change.
+
 ## Regression coverage
+
+`test/integration/web-ai-submission-and-body.test.mjs` runs real Chromium DOM
+operations against local fixtures: pre-submit attachment failure, preparing and
+uncertain submission rejection, state at the actual send click, lost acknowledgement
+without duplicate submission, and full response capture with sibling completion
+controls and a later speaker-only shell.
 
 `test/integration/web-ai-target-and-model-evolution.test.mjs` exercises a paused
 unrelated renderer, a previously unknown family, reordered/non-unit slider values,

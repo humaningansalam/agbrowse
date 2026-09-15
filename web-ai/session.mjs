@@ -242,7 +242,7 @@ function saveStore() {
 
 /**
  * @param {WebAiEnvelope|null|undefined} envelope
- * @param {{ vendor?: string, deadlineAt?: string|null, targetId?: string|null, tabId?: string|null, tabState?: Record<string, unknown>, originalUrl?: string|null, conversationUrl?: string|null, conversationId?: string|null, generation?: number, envelopeSummary?: Record<string, unknown> }} [meta]
+ * @param {{ vendor?: string, status?: string, deadlineAt?: string|null, targetId?: string|null, tabId?: string|null, tabState?: Record<string, unknown>, originalUrl?: string|null, conversationUrl?: string|null, conversationId?: string|null, generation?: number, envelopeSummary?: Record<string, unknown> }} [meta]
  * @returns {WebAiSession}
  */
 export function createSession(envelope, meta = {}) {
@@ -282,7 +282,7 @@ export function createSession(envelope, meta = {}) {
         responseTurnId: null,
         promptHash: `sha256:${hashPrompt(envelope || {})}`,
         envelopeSummary: meta.envelopeSummary || {},
-        status: 'sent',
+        status: meta.status || 'sent',
         answer: null,
         lastError: null,
         warnings: [],
@@ -396,11 +396,15 @@ export function updateSessionAsync(sessionId, patch = {}, stillActive) {
  *
  * @param {string} sessionId
  * @param {WebAiEnvelope|null|undefined} envelope
- * @param {{ targetId?: string|null, conversationUrl?: string|null, deadlineAt?: string|null, envelopeSummary?: Record<string, unknown>, modelSelection?: unknown }} [meta]
+ * @param {{ status?: string, targetId?: string|null, conversationUrl?: string|null, deadlineAt?: string|null, envelopeSummary?: Record<string, unknown>, modelSelection?: unknown }} [meta]
  * @returns {Promise<WebAiSession|null|typeof DEADLINE_PASSED>}
  */
 export function beginSessionGeneration(sessionId, envelope, meta = {}) {
     return mutateSessionAsync(sessionId, (current) => {
+        // A lost submit acknowledgement is not permission to submit twice.
+        if (['submitting', 'submission-unknown'].includes(current.status)) {
+            assertSessionPollable(current);
+        }
         const vendor = envelope?.vendor || current.vendor;
         if (vendor && current.vendor && vendor !== current.vendor) {
             throw new WebAiError({
@@ -445,7 +449,7 @@ export function beginSessionGeneration(sessionId, envelope, meta = {}) {
             promptHash: `sha256:${hashPrompt(envelope || {})}`,
             envelopeSummary: meta.envelopeSummary || {},
             ...(meta.modelSelection !== undefined ? { modelSelection: meta.modelSelection } : {}),
-            status: 'sent',
+            status: meta.status || 'sent',
             answer: null,
             completedAt: null,
             submittedUserMessageId: null,
@@ -459,6 +463,39 @@ export function beginSessionGeneration(sessionId, envelope, meta = {}) {
             lastStreamingState: 'unknown',
             lastResponseCharCount: 0,
         });
+    });
+}
+
+/**
+ * Reject an unfinished submit before attaching a browser or extending a poll.
+ * Older durable conversations without turn anchors remain readable; a provider
+ * home page with no committed message is not a conversation to poll.
+ * @param {WebAiSession|null|undefined} session
+ */
+export function assertSessionPollable(session) {
+    if (!session || session.vendor !== 'chatgpt') return;
+    const summary = session.envelopeSummary || {};
+    if (session.surface === 'work' || summary.surface === 'work'
+        || session.sessionType === 'work' || session.taskUrl
+        || session.sessionType === 'deep-research' || summary.researchMode === 'deep'
+        || summary.research === 'deep' || session.researchMode === 'deep') return;
+    if (COMPLETED_SESSION_STATUSES.has(session.status) || session.completedAt) return;
+    const pending = ['preparing', 'submitting', 'submission-unknown'].includes(session.status);
+    const failed = /** @type {any} */ (session.lastError)?.stage === 'submission';
+    const unbound = !sessionConversationId(session)
+        && !session.submittedUserMessageId && !session.submittedUserTurnId;
+    if (!pending && !failed && !unbound) return;
+    throw new WebAiError({
+        errorCode: 'session.submission-unverified',
+        stage: 'submission', vendor: 'chatgpt', mutationAllowed: false,
+        retryHint: session.status === 'preparing' ? 'wait-for-send-result' : 'inspect-session-before-retry',
+        message: `Session ${session.sessionId} has no confirmed submission to poll (${session.status}); do not infer send success from sessions list`,
+        evidence: {
+            sessionId: session.sessionId, generation: sessionGeneration(session),
+            targetId: session.targetId, status: session.status,
+            promptSubmitted: session.status === 'preparing' ? false
+                : failed ? /** @type {any} */ (session.lastError).promptSubmitted ?? null : null,
+        },
     });
 }
 

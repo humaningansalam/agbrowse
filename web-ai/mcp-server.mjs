@@ -11,7 +11,7 @@ import { isWorkSession, pollWorkSession } from './chatgpt-work-picker.mjs';
 import { geminiSendWebAi, geminiPollWebAi } from './gemini-live.mjs';
 import { grokSendWebAi, grokPollWebAi } from './grok-live.mjs';
 import { runDoctor } from './doctor.mjs';
-import { getSession, resolvePollTimeoutSec, expiredSessionTimeoutResult } from './session.mjs';
+import { assertSessionPollable, getSession, resolvePollTimeoutSec, expiredSessionTimeoutResult } from './session.mjs';
 import {
     captureCopiedResponseText,
     CHATGPT_COPY_SELECTORS,
@@ -330,6 +330,7 @@ async function runMcpSessionPoll(name, args, deps) {
     const sessionId = args.sessionId;
     const stored = getSession(sessionId);
     if (!stored) throw new Error(`no session record for ${sessionId}`);
+    assertSessionPollable(stored);
     providerFromArgs({ provider: args.provider || args.vendor || stored.vendor || 'chatgpt' });
     // Refuse an expired session before resolving its page. The poll clamp keeps
     // a positive minimum so providers cannot read it as "no budget", so without
@@ -338,6 +339,7 @@ async function runMcpSessionPoll(name, args, deps) {
     const expiredBeforeLock = expiredSessionTimeoutResult(sessionId, mcpFallbackVendor);
     if (expiredBeforeLock) return expiredBeforeLock;
     return withSessionCommandLock(sessionId, () => {
+        assertSessionPollable(getSession(sessionId));
         // Re-checked inside the lock: acquiring it retries 200 times at 25ms,
         // so a nearly-expired session can pass the check above and expire
         // before the page is ever resolved.

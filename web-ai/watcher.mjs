@@ -14,6 +14,7 @@ import { isWorkSession, pollWorkSession } from './chatgpt-work-picker.mjs';
 import { geminiPollWebAi } from './gemini-live.mjs';
 import { grokPollWebAi } from './grok-live.mjs';
 import {
+    assertSessionPollable,
     DEADLINE_PASSED,
     GENERATION_CHANGED,
     getSession,
@@ -76,6 +77,7 @@ export async function watchSession(deps, input = {}, notifier = null) {
         });
     }
     const generation = sessionGeneration(startingSession);
+    assertSessionPollable(startingSession);
     const lock = acquireWatcherSessionLock(options.sessionId, { staleMs: options.lockStaleMs });
     const notify = notifier || createStdoutNotifier({ json: options.json });
     /** @type {any[]} */
@@ -190,6 +192,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
     if (sessionGeneration(session) !== generation) {
         return supersededWatchTick(session, vendor, generation);
     }
+    assertSessionPollable(session);
     if (options.vendor && session.vendor && options.vendor !== session.vendor) {
         throw new WebAiError({
             errorCode: 'watcher.vendor-mismatch',

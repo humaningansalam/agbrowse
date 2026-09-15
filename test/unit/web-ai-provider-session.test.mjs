@@ -300,7 +300,14 @@ describe('web-ai provider integration (source-string contracts)', () => {
     });
 
     it('all three providers resolve session on poll via input.session > findActiveSession', () => {
-        for (const src of [chatgptSrc, geminiSrc, grokSrc]) {
+        // ChatGPT validates the explicit row before touching the browser, then
+        // uses that same row rather than looking up any ambient session.
+        const chatPoll = chatgptSrc.slice(chatgptSrc.indexOf('async function runPollWebAi('));
+        expect(chatPoll).toMatch(/const boundSession = input\.session \? await readSessionAsync\(input\.session\) : null/);
+        expect(chatPoll.indexOf('assertSessionPollable(boundSession)')).toBeLessThan(chatPoll.indexOf('const page = await requireChatGptPage'));
+        expect(chatPoll).toMatch(/const session = input\.session\s*\? boundSession\s*: findActiveSession\(/);
+        expect(chatPoll).toMatch(/session && sessionToBaseline\(session\)/);
+        for (const src of [geminiSrc, grokSrc]) {
             // ONE regex spanning both branches of the ternary, so it pins the
             // ORDER and not merely the presence of each half. Split assertions
             // also accepted the reverse — `findActiveSession(...) || (input.session

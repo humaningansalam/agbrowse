@@ -30,6 +30,7 @@ import { cleanupIdleTabs, DEFAULT_MAX_TABS } from '../skills/browser/tab-lifecyc
 import { resolveSessionPage, withSessionPage } from './tab-recovery.mjs';
 import { withSessionCommandLock } from './session-store.mjs';
 import {
+    assertSessionPollable,
     applyExplicitSessionDeadlineOverride,
     getSession,
     resolvePollTimeoutSec,
@@ -1294,6 +1295,7 @@ async function runBoundCommand(command, deps, input, pollFn, stopFn) {
         // command lock for the whole long poll; target ownership is enforced by
         // the active-command row below, whose owner PID is reclaimable on death.
         const startingSession = getSession(input.session);
+        assertSessionPollable(startingSession);
         await applyExplicitSessionDeadlineOverride(
             input.session,
             input,

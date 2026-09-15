@@ -71,7 +71,7 @@ export function readLatestUserTurnIdentity(options = {}) {
  */
 export function readAssistantTurnOrderingInPage(selectors) {
     const turns = Array.from(document.querySelectorAll(selectors.join(', ')));
-    const roleOf = (/** @type {Element} */ turn) => turn.getAttribute('data-message-author-role')
+    const roleOf = (/** @type {Element} */ turn) => turn.getAttribute('data-turn') || turn.getAttribute('data-message-author-role')
         || turn.querySelector('[data-message-author-role]')?.getAttribute('data-message-author-role');
     const lastAssistantTurn = turns.findLast((turn) => roleOf(turn) === 'assistant');
     const lastUserTurn = turns.findLast((turn) => roleOf(turn) === 'user');
@@ -229,16 +229,19 @@ export function resolveTopLevelAssistantTurns(selectors) {
     const turns = [];
     for (const roleNode of roleNodes) {
         const wrapperSelectors = activeSelectors.filter(selector => !roleSelectors.includes(selector));
-        const candidate = wrapperSelectors.length && typeof roleNode.closest === 'function'
-            ? roleNode.closest(wrapperSelectors.join(', ')) || roleNode
-            : roleNode;
+        // The response actions are siblings of the message body on section/div
+        // layouts too. Capture and completion must resolve the same turn root.
+        const candidate = roleNode.closest?.('[data-testid^="conversation-turn"]')
+            || (wrapperSelectors.length && typeof roleNode.closest === 'function'
+                ? roleNode.closest(wrapperSelectors.join(', ')) || roleNode : roleNode);
         if (turns.some(turn => turn === candidate || turn.contains(candidate))) continue;
         for (let i = turns.length - 1; i >= 0; i--) {
             if (candidate.contains(turns[i])) turns.splice(i, 1);
         }
         turns.push(candidate);
     }
-    return turns;
+    const FOLLOWING = document?.defaultView?.Node?.DOCUMENT_POSITION_FOLLOWING ?? 4;
+    return turns.sort((a, b) => a === b ? 0 : (a.compareDocumentPosition(b) & FOLLOWING) ? -1 : 1);
 }
 
 /**
@@ -450,13 +453,29 @@ export function readAssistantSnapshotSources({
         unique.sort((a, b) => (a.compareDocumentPosition(b) & FOLLOWING) ? -1 : 1);
         return unique;
     };
-    const textOf = (/** @type {any} */ node) => String(node.innerText || node.textContent || '').trim();
+    // Empty rendered text is not permission to return a hidden speaker label.
+    const textOf = (/** @type {any} */ node) => String(node.innerText ?? node.textContent ?? '').trim();
     const describe = (/** @type {any} */ node) => {
-        const messageNode = node.matches?.('[data-message-id]') ? node : node.querySelector?.('[data-message-id]');
+        const messages = Array.from(node.querySelectorAll?.('[data-message-author-role="assistant"][data-message-id]') || []);
+        const messageNode = node.matches?.('[data-message-id]') ? node : messages.at(-1) || node.querySelector?.('[data-message-id]');
+        // Keep the entire message, including multiple markdown blocks. A turn
+        // wrapper is not itself the answer: it also contains tool/status chrome.
+        const bodyNodes = messageNode ? [messageNode]
+            : Array.from(node.querySelectorAll?.('.markdown, [data-message-content]') || []);
+        const bodies = bodyNodes.filter(body => !bodyNodes.some(other => other !== body && other.contains(body)));
         const turnNode = node.closest?.('[data-testid^="conversation-turn"]')
             || node.querySelector?.('[data-testid^="conversation-turn"]');
         return {
-            text: textOf(node),
+            // The exact message body remains useful when an offscreen turn's
+            // innerText is empty. Do not fall back to the whole turn textContent
+            // (speaker headings, tool logs and accessibility chrome).
+            text: bodies.length ? bodies.map(body => String(body.innerText || body.textContent || '').trim()).filter(Boolean).join('\n\n') : (() => {
+                const copy = node.cloneNode?.(true);
+                if (!copy) return textOf(node);
+                copy.querySelectorAll?.('.sr-only, [aria-hidden="true"], [hidden], script, style')
+                    .forEach(child => child.remove());
+                return copy.textContent?.trim() ? textOf(node) : '';
+            })(),
             messageId: messageNode?.getAttribute?.('data-message-id') || null,
             turnId: turnNode?.getAttribute?.('data-testid') || null,
         };
@@ -559,14 +578,23 @@ export function readTopLevelAssistantSnapshots(input) {
         ? (0, eval)(`(${resolverSource})`)
         : resolveTopLevelAssistantTurns;
     return resolver(selectors).map((node, turnIndex) => {
-        const messageNode = node.matches?.('[data-message-id]')
-            ? node
-            : node.querySelector?.('[data-message-id]');
-        const turnNode = node.matches?.('[data-testid^="conversation-turn"]')
-            ? node
-            : node.querySelector?.('[data-testid^="conversation-turn"]');
+        const messages = Array.from(node.querySelectorAll?.('[data-message-author-role="assistant"][data-message-id]') || []);
+        const messageNode = node.matches?.('[data-message-id]') ? node : messages.at(-1) || node.querySelector?.('[data-message-id]');
+        const bodyNodes = messageNode ? [messageNode]
+            : Array.from(node.querySelectorAll?.('.markdown, [data-message-content]') || []);
+        const bodies = bodyNodes.filter(body => !bodyNodes.some(other => other !== body && other.contains(body)));
+        const turnNode = node.closest?.('[data-testid^="conversation-turn"]')
+            || node.querySelector?.('[data-testid^="conversation-turn"]');
         return {
-            text: String((/** @type {any} */ (node)).innerText || node.textContent || '').trim(),
+            text: bodies.length ? bodies.map(body => String((/** @type {any} */ (body)).innerText || body.textContent || '').trim()).filter(Boolean).join('\n\n')
+                : (() => {
+                    const copy = node.cloneNode?.(true);
+                    if (!copy) return String((/** @type {any} */ (node)).innerText ?? node.textContent ?? '').trim();
+                    (/** @type {Element} */ (copy)).querySelectorAll?.('.sr-only, [aria-hidden="true"], [hidden], script, style')
+                        .forEach(child => child.remove());
+                    return copy.textContent?.trim()
+                        ? String((/** @type {any} */ (node)).innerText ?? node.textContent ?? '').trim() : '';
+                })(),
             messageId: messageNode?.getAttribute?.('data-message-id') || null,
             turnId: turnNode?.getAttribute?.('data-testid') || null,
             turnIndex,

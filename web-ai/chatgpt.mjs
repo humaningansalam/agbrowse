@@ -8,6 +8,7 @@ import { renderQuestionEnvelope, renderQuestionEnvelopeWithContext, normalizeEnv
 import { defineCapability, probeFirstVisibleSelector, probeHostMatches, runCapabilities, worstCapabilityState } from './capability.mjs';
 import { INPUT_SELECTORS as CHATGPT_COMPOSER_SELECTORS } from './chatgpt-composer.mjs';
 import {
+    assertSessionPollable,
     beginSessionGeneration,
     bindSessionConversation,
     bindSessionToTab,
@@ -35,7 +36,7 @@ import {
 } from './session.mjs';
 import { readSessionAsync, sessionStoreReadWasCorrupt } from './session-store.mjs';
 import { extractDurableConversationId } from './conversation-url.mjs';
-import { WebAiError } from './errors.mjs';
+import { WebAiError, wrapError } from './errors.mjs';
 import { POLL_EXPIRED, monotonicNowMs, withPollDeadline } from './poll-deadline.mjs';
 import { detectInterstitial, INTERSTITIAL_SHELL_SELECTORS_BY_PROVIDER } from './interstitial.mjs';
 import { finalizeProviderTab } from './tab-finalizer.mjs';
@@ -314,6 +315,12 @@ export async function waitForChatGptRepomixAttachmentCount(page, expectedCount, 
  */
 export async function sendWebAi(deps, input = {}) {
     const envelope = normalizeEnvelope(input);
+    if (input.session) {
+        const previous = await readSessionAsync(input.session);
+        if (previous && ['submitting', 'submission-unknown'].includes(previous.status)) {
+            assertSessionPollable(previous);
+        }
+    }
     const repomixMode = String(input.contextTransform || '').trim().toLowerCase() === 'repomix'
         || input.preparedContextPack?.contextTransform === 'repomix';
     let contextPack = repomixMode
@@ -325,6 +332,8 @@ export async function sendWebAi(deps, input = {}) {
     const requestedPaths = Array.isArray(input.filePaths) && input.filePaths.length
         ? input.filePaths
         : (input.filePath ? [input.filePath] : []);
+    // Validate raw uploads before touching the composer or publishing a session.
+    if (!repomixMode) preflightChatGptUploadFiles(requestedPaths, input);
     /** @type {string[]} */
     let uploadPaths = [];
     /** @type {any[]} */
@@ -356,6 +365,13 @@ export async function sendWebAi(deps, input = {}) {
         // Preserve the raw workflow's existing navigation and mutation order.
         contextPack = await prepareContextForBrowser(input);
         contextAttachments = Array.isArray(contextPack?.attachments) ? contextPack.attachments : [];
+        if (contextAttachments.length && requestedPaths.length) {
+            throw new WebAiError({ errorCode: 'provider.attachment-preflight', stage: 'attachment-preflight',
+                vendor: 'chatgpt', mutationAllowed: false, retryHint: 'inline-only-or-file',
+                message: 'context package upload and --file upload cannot be combined yet' });
+        }
+        uploadPaths = requestedPaths.length ? requestedPaths : contextAttachments.slice(0, 1).map(file => file.path);
+        uploadFiles = preflightChatGptUploadFiles(uploadPaths, input);
     }
     const rendered = contextPack
         ? contextPack.transport === 'inline'
@@ -404,6 +420,7 @@ export async function sendWebAi(deps, input = {}) {
     const envelopeSummary = { ...summarizeEnvelope(input, contextPack), assistantCount };
     const session = input.session
         ? await beginSessionGeneration(input.session, envelope, {
+            status: 'preparing',
             targetId,
             conversationUrl: page.url(),
             deadlineAt,
@@ -411,6 +428,7 @@ export async function sendWebAi(deps, input = {}) {
             modelSelection: selectedModel?.modelSelection,
         })
         : createSession(envelope, {
+            status: 'preparing',
             targetId,
             originalUrl: input.url || page.url(),
             conversationUrl: page.url(),
@@ -428,6 +446,9 @@ export async function sendWebAi(deps, input = {}) {
         });
     }
     const generation = sessionGeneration(session);
+    let submitAttempted = false;
+    let submissionConfirmed = false;
+    try {
     if (selectedModel?.modelSelection) {
         const modelWrite = await updateSessionForGeneration(session.sessionId, generation, {
             modelSelection: selectedModel.modelSelection,
@@ -475,22 +496,6 @@ export async function sendWebAi(deps, input = {}) {
         let attachmentWarnings = [];
         /** @type {any[]} */
         let usedFallbacks = [];
-        if (!repomixMode) {
-            const contextAttachmentPath = contextAttachments[0]?.path;
-            if (contextAttachmentPath && requestedPaths.length) {
-                throw new WebAiError({
-                    errorCode: 'provider.attachment-preflight',
-                    stage: 'attachment-preflight',
-                    vendor: 'chatgpt',
-                    retryHint: 'inline-only-or-file',
-                    message: 'context package upload and --file upload cannot be combined yet',
-                });
-            }
-            uploadPaths = requestedPaths.length
-                ? requestedPaths
-                : (contextAttachmentPath ? [contextAttachmentPath] : []);
-        }
-        if (!repomixMode) uploadFiles = uploadPaths.map(fileInfoFromPath);
         if (uploadPaths.length) {
             const uploadResolution = await resolveOptionalChatGptUploadTarget(page, traceCtx);
             const upload = await attachLocalFilesLive(page, uploadFiles, {
@@ -527,12 +532,18 @@ export async function sendWebAi(deps, input = {}) {
         const sendResolution = await resolveOptionalChatGptSendTarget(page, traceCtx);
         const totalUploadBytes = uploadFiles.reduce((total, file) => total + (Number(file.sizeBytes) || 0), 0);
         const submitTimeoutMs = sendButtonTimeoutMs(uploadPaths, totalUploadBytes);
+        const submitting = await updateSessionForGeneration(session.sessionId, generation, { status: 'submitting' });
+        if (!submitting || submitting === DEADLINE_PASSED || submitting === GENERATION_CHANGED) {
+            throw generationSupersededError(session.sessionId, generation);
+        }
+        submitAttempted = true;
         const submitResult = await adapter.submitPrompt({
             sendTarget: /** @type {any} */ (sendResolution?.target || null),
             sendButtonTimeoutMs: submitTimeoutMs,
             requireEnabledSendButton: uploadPaths.length > 0,
         });
         if (submitResult.failure === 'send-button-disabled') {
+            submitAttempted = false;
             throw new WebAiError({
                 errorCode: 'provider.send-click',
                 stage: 'send-click',
@@ -572,6 +583,7 @@ export async function sendWebAi(deps, input = {}) {
             });
         }
         const anchored = await updateSessionForGeneration(session.sessionId, generation, {
+            status: 'sent',
             submittedUserMessageId: submittedUser.messageId,
             submittedUserTurnId: submittedUser.turnId,
             responseMessageId: null,
@@ -591,6 +603,7 @@ export async function sendWebAi(deps, input = {}) {
                 evidence: { sessionId: session.sessionId, generation, targetId, submittedUser },
             });
         }
+        submissionConfirmed = true;
         const traceSummary = persistResolverTrace(session.sessionId, traceCtx);
         tracePersisted = true;
         return {
@@ -626,6 +639,19 @@ export async function sendWebAi(deps, input = {}) {
         };
     } finally {
         if (!tracePersisted) persistResolverTrace(session.sessionId, traceCtx);
+    }
+    } catch (cause) {
+        const error = wrapError(cause);
+        error.evidence = { ...(error.evidence || {}), sessionId: session.sessionId,
+            generation, targetId, promptSubmitted: submissionConfirmed ? true : submitAttempted ? null : false };
+        if (!submissionConfirmed) {
+            await updateSessionForGeneration(session.sessionId, generation, {
+                status: submitAttempted ? 'submission-unknown' : 'error',
+                lastError: { errorCode: error.errorCode, message: error.message, stage: 'submission',
+                    promptSubmitted: submitAttempted ? null : false },
+            });
+        }
+        throw error;
     }
 }
 
@@ -854,6 +880,7 @@ export async function pollWebAi(deps, input = {}) {
         filePolicyAtArm = resolveFileArtifactPolicy(input, null);
     } else {
         const session = input.session ? getSession(input.session) : null;
+        assertSessionPollable(session);
         filePolicyAtArm = resolveFileArtifactPolicy(input, session);
         // A stored deadline is read in MILLISECONDS here. The budget resolver
         // floors its answer at one second, which is right for a polling budget
@@ -948,20 +975,26 @@ function buildHardTimeoutResult(input, observations) {
  */
 async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_INFINITY, sharedObservations, sharedRun) {
     const vendor = input.vendor || 'chatgpt';
+    const boundSession = input.session ? await readSessionAsync(input.session) : null;
+    if (boundSession && Number.isInteger(Number(input.generation)) && Number(input.generation) > 0
+        && Number(input.generation) !== sessionGeneration(boundSession)) {
+        return buildGenerationSupersededResult(vendor, boundSession, Number(input.generation));
+    }
+    assertSessionPollable(boundSession);
     // Read through the awaited lock: this runs inside the armed deadline, and
     // the blocking form suspends the timer enforcing it.
     const timeout = Math.max(1, Number(input.timeout) > 0
         ? Number(input.timeout)
         : resolveTimeoutBudgetSec(
             input,
-            input.session ? await readSessionAsync(input.session) : null,
+            boundSession,
             vendor,
         ),
     );
     const page = await requireChatGptPage(deps);
     const url = page.url();
     const session = input.session
-        ? await readSessionAsync(input.session)
+        ? boundSession
         : findActiveSession({
             vendor,
             targetId: await deps.getTargetId?.().catch(() => null) || null,
@@ -975,6 +1008,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
     if (session && sessionGeneration(session) !== expectedGeneration) {
         return buildGenerationSupersededResult(vendor, session, expectedGeneration);
     }
+    assertSessionPollable(session);
     // B23: a corrupt store collapses to an empty one, so a failed read looks
     // exactly like "no session". The flag is read HERE, right after the lookup,
     // so the observation is about this read and not some later one.
@@ -1840,15 +1874,16 @@ async function isResponseFinished(page, sample, minTurnIndex) {
             const turns = resolver(selectors);
             for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex--) {
                 const turn = turns[turnIndex];
-                const messageNode = turn.matches?.('[data-message-id]') ? turn : turn.querySelector?.('[data-message-id]');
-                const turnNode = turn.matches?.('[data-testid^="conversation-turn"]')
-                    ? turn
-                    : turn.querySelector?.('[data-testid^="conversation-turn"]');
+                const messages = Array.from(turn.querySelectorAll?.('[data-message-author-role="assistant"][data-message-id]') || []);
+                const messageNode = turn.matches?.('[data-message-id]') ? turn : messages.at(-1) || turn.querySelector?.('[data-message-id]');
+                const turnNode = turn.closest?.('[data-testid^="conversation-turn"]')
+                    || turn.querySelector?.('[data-testid^="conversation-turn"]');
                 const messageId = messageNode?.getAttribute?.('data-message-id') || null;
                 const turnId = turnNode?.getAttribute?.('data-testid') || null;
                 const hasIdentity = Boolean(sample.messageId || sample.turnId);
-                const identityMatches = (!sample.messageId || sample.messageId === messageId)
-                    && (!sample.turnId || sample.turnId === turnId);
+                const identityMatches = sample.messageId
+                    ? sample.messageId === messageId
+                    : sample.turnId === turnId;
                 if (hasIdentity ? !identityMatches : turnIndex < minTurnIndex) continue;
                 return { finished: Boolean(turn.querySelector(finishedSelector)), messageId, turnId, turnIndex };
             }
