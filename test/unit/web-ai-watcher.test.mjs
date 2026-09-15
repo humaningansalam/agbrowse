@@ -27,7 +27,7 @@ vi.mock('../../skills/browser/tab-manager.mjs', () => ({
     createTab: vi.fn(), waitForPageByTargetId: vi.fn(), listManagedTabs: vi.fn(), closeTab: vi.fn(),
 }));
 
-import { acquireWatcherSessionLock, hasStreamingIndicator, watchSessionOnce } from '../../web-ai/watcher.mjs';
+import { acquireWatcherSessionLock, hasStreamingIndicator, watchSession, watchSessionOnce } from '../../web-ai/watcher.mjs';
 import { createSession, getSession, updateSession } from '../../web-ai/session.mjs';
 
 const ORIGINAL_HOME = process.env.BROWSER_AGENT_HOME;
@@ -130,6 +130,42 @@ describe('web-ai watcher streaming guard', () => {
             status: 'complete', answer: 'done', completedAt,
         });
         expect(watcherSrc).not.toContain('watcher-complete-deferred-streaming');
+    });
+});
+
+describe('web-ai watcher provider block handling', () => {
+    it('exits on a recoverable provider interstitial without terminalizing the session', async () => {
+        const session = createWatcherSession();
+        pollState.impl = async () => ({
+            ok: false,
+            status: 'blocked',
+            answerText: '',
+            errorCode: 'provider.interstitial',
+            stage: 'provider-interstitial',
+            retryHint: 'wait-and-retry',
+            warnings: ['provider-rate-limited'],
+        });
+        const events = [];
+
+        const result = await watchSession(baseDeps(), {
+            session: session.sessionId,
+            intervalMs: 1,
+            pollTimeoutSec: 30,
+            captureEvents: true,
+        }, async event => { events.push(event); });
+
+        expect(result).toMatchObject({
+            ok: false,
+            status: 'blocked',
+            final: {
+                status: 'blocked',
+                terminal: false,
+                errorCode: 'provider.interstitial',
+                retryHint: 'wait-and-retry',
+            },
+        });
+        expect(events.some(event => event.type === 'watch.blocked')).toBe(true);
+        expect(getSession(session.sessionId).status).toBe('polling');
     });
 });
 

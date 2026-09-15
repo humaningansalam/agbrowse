@@ -22,7 +22,7 @@ process.env.BROWSER_AGENT_HOME = mkdtempSync(join(tmpdir(), 'agbrowse-activity-p
  * activity verdict, answer text and terminal evidence are controlled, on a
  * virtual clock so a 5s weak window costs milliseconds.
  */
-function makePage({ activity, text, finished, turnOrdering = 'ordered' }) {
+function makePage({ activity, text, finished, turnOrdering = 'ordered', rateLimitDialog = '' }) {
     // The virtual clock advances only through `waitForTimeout`, which the poll
     // loop awaits every iteration. Mocking Date.now globally made the suite
     // allocate unboundedly when run in parallel with other files, so the clock is
@@ -61,9 +61,11 @@ function makePage({ activity, text, finished, turnOrdering = 'ordered' }) {
             }
             return true;
         },
-        locator: () => ({
+        locator: (selector) => ({
             first: () => ({ isVisible: async () => false }),
-            all: async () => [],
+            all: async () => selector === '[role="dialog"]' && rateLimitDialog
+                ? [{ isVisible: async () => true, innerText: async () => rateLimitDialog }]
+                : [],
         }),
     };
     return { page, advance: (ms) => { offset += ms; } };
@@ -146,6 +148,38 @@ describe('ChatGPT poll loop activity strata (G8 behavioural)', () => {
         const { page } = makePage({
             activity: { strength: 'none', evidence: '' },
             text: 'The UI once displayed 생각 중지됨, but this is the final analysis.',
+            finished: true,
+        });
+        const { result } = await poll(page);
+        expect(result).toMatchObject({ ok: true, status: 'complete' });
+    });
+
+    it('returns a typed recoverable block for ChatGPT request-throttling dialogs', async () => {
+        const { page } = makePage({
+            activity: { strength: 'none', evidence: '' },
+            text: '',
+            finished: false,
+            rateLimitDialog: '요청이 너무 많습니다 요청을 너무 빠르게 보내고 있습니다. 몇 분 후 다시 시도해 주세요.',
+        });
+        const { result, session } = await poll(page, 30);
+        expect(result).toMatchObject({
+            ok: false,
+            status: 'blocked',
+            errorCode: 'provider.interstitial',
+            stage: 'provider-interstitial',
+            retryHint: 'wait-and-retry',
+            recoverable: true,
+            evidence: { kind: 'rate-limited' },
+        });
+        // The conversation remains resumable; a temporary provider block must
+        // not destroy the persisted session or turn it into a terminal error.
+        expect(getSession(session.sessionId).status).not.toBe('error');
+    });
+
+    it('does not flag rate-limit wording inside a normal assistant answer', async () => {
+        const { page } = makePage({
+            activity: { strength: 'none', evidence: '' },
+            text: 'The server may return “too many requests”; this is the final answer.',
             finished: true,
         });
         const { result } = await poll(page);

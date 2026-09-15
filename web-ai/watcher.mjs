@@ -126,6 +126,9 @@ export async function watchSession(deps, input = {}, notifier = null) {
                 vendor: tick.vendor,
                 url: tick.url || null,
                 warnings: tick.warnings || [],
+                ...(tick.errorCode ? { errorCode: tick.errorCode } : {}),
+                ...(tick.stage ? { stage: tick.stage } : {}),
+                ...(tick.retryHint ? { retryHint: tick.retryHint } : {}),
             });
 
             if (tick.terminal === true || tick.status === 'superseded') {
@@ -138,6 +141,19 @@ export async function watchSession(deps, input = {}, notifier = null) {
             if (tick.errorCode === 'provider.file-artifact') {
                 final = { ...tick, terminal: true };
                 await emit({ type: 'watch.file-artifact-unsatisfied', status: tick.status, terminal: true, vendor: tick.vendor });
+                break;
+            }
+            // A provider-side rate-limit/interstitial is recoverable for the
+            // SAME persisted session, but spinning the watcher only hides the
+            // actionable state behind endless "polling" ticks. Exit the watch
+            // without marking the session terminal so a later resume can retry.
+            if (tick.errorCode === 'provider.interstitial') {
+                final = { ...tick, status: 'blocked', terminal: false };
+                await emit({
+                    type: 'watch.blocked', status: 'blocked', terminal: false,
+                    vendor: tick.vendor, errorCode: tick.errorCode,
+                    retryHint: tick.retryHint || 'wait-and-retry',
+                });
                 break;
             }
             if (options.once) {
@@ -155,7 +171,8 @@ export async function watchSession(deps, input = {}, notifier = null) {
             // Not unconditionally true: a fail-closed tick has to reach the
             // caller as a failure.
             ok: final?.errorCode !== 'provider.file-artifact'
-                && final?.errorCode !== 'session.generation-superseded',
+                && final?.errorCode !== 'session.generation-superseded'
+                && final?.errorCode !== 'provider.interstitial',
             status: final?.status || 'watch-complete',
             sessionId: options.sessionId,
             generation,
@@ -319,7 +336,9 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         if (sessionGeneration(refreshed) !== generation) {
             return supersededWatchTick(session, vendor, generation);
         }
-        let status = refreshed.status || pollResult.status || 'polling';
+        let status = pollResult?.errorCode === 'provider.interstitial'
+            ? 'blocked'
+            : refreshed.status || pollResult.status || 'polling';
         /** @type {string[]} */
         const watcherWarnings = [];
 

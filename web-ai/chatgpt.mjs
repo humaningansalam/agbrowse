@@ -271,6 +271,47 @@ const CHATGPT_REPOMIX_UPLOAD_PROGRESS_SELECTORS = [
     .map(root => `${root} ${selector}`)
     .join(', '));
 
+const CHATGPT_RATE_LIMIT_DIALOG_PATTERNS = [
+    /too many requests/i,
+    /requests? too quickly/i,
+    /try again in (?:a few|few|some) minutes/i,
+    /요청이 너무 많습니다/,
+    /요청을 너무 빠르게 보내고 있습니다/,
+    /몇 분 후 다시 시도/,
+];
+
+/**
+ * Detect ChatGPT's visible request-throttling dialog without scanning answer
+ * text. The dialog scope matters: an assistant can legitimately discuss the
+ * phrase "too many requests", and that must never terminate its own response.
+ *
+ * @param {any} page
+ * @returns {Promise<{ text: string, pattern: string }|null>}
+ */
+async function readChatGptRateLimitDialog(page) {
+    let dialogs;
+    try {
+        dialogs = await page.locator('[role="dialog"]').all();
+    } catch {
+        return null;
+    }
+    if (!Array.isArray(dialogs)) return null;
+    for (const dialog of dialogs) {
+        try {
+            if (typeof dialog?.isVisible !== 'function' || !await dialog.isVisible()) continue;
+            const text = typeof dialog.innerText === 'function'
+                ? String(await dialog.innerText()).replace(/\s+/g, ' ').trim()
+                : '';
+            if (!text) continue;
+            const matched = CHATGPT_RATE_LIMIT_DIALOG_PATTERNS.find(pattern => pattern.test(text));
+            if (matched) return { text: text.slice(0, 1_000), pattern: matched.source };
+        } catch {
+            // A detached transient dialog is not evidence of a provider block.
+        }
+    }
+    return null;
+}
+
 /**
  * Repomix may add several artifacts alongside existing user/code attachments.
  * Count visible chips instead of matching basenames so duplicate names remain
@@ -1198,6 +1239,31 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                     error: 'conversation changed during poll',
                 }, observations);
             }
+        }
+        const rateLimitDialog = await readChatGptRateLimitDialog(page);
+        if (rateLimitDialog) {
+            const warnings = mergeObservationList(['provider-rate-limited'], observations);
+            return {
+                ok: false,
+                vendor,
+                status: 'blocked',
+                url: page.url(),
+                ...(session ? { sessionId: session.sessionId, generation: expectedGeneration } : {}),
+                answerText: '',
+                baseline,
+                usedFallbacks: [],
+                warnings,
+                recoverable: true,
+                errorCode: 'provider.interstitial',
+                stage: 'provider-interstitial',
+                retryHint: 'wait-and-retry',
+                error: 'ChatGPT temporarily rate-limited this conversation',
+                evidence: {
+                    kind: 'rate-limited',
+                    dialogText: rateLimitDialog.text,
+                    matchedPattern: rateLimitDialog.pattern,
+                },
+            };
         }
         const split = await readAssistantSnapshotsSplit(page, {
             submittedUserMessageId,
