@@ -27,17 +27,29 @@ function pageFor({ endpoint = 'auth-session', retryAfter = '120' } = {}) {
     return { url: () => 'https://chatgpt.com/c/conversation-A', request: { get } };
 }
 
+function successfulPage() {
+    const conversation = { conversation_id: 'conversation-A', current_node: 'final-A', mapping: {
+        'user-A': { id: 'user-A', parent: null, message: { id: 'user-A', author: { role: 'user' } } },
+        'final-A': { id: 'final-A', parent: 'user-A', message: { id: 'final-A', author: { role: 'assistant' },
+            channel: 'final', status: 'finished_successfully', end_turn: true,
+            content: { parts: ['done'] } } },
+    } };
+    const get = vi.fn(async url => ({ status: () => 200, ok: () => true, dispose: async () => {},
+        json: async () => url.endsWith('/api/auth/session') ? { accessToken: 'private-test-token' } : conversation }));
+    return { url: () => 'https://chatgpt.com/c/conversation-A', request: { get } };
+}
+
 describe('optional server probe throttling is not generation failure', () => {
     it.each(['auth-session', 'conversation'])('distinguishes a 429 from %s and respects its cooldown across callers', async endpoint => {
         const page = pageFor({ endpoint });
         const result = await readServerResponse(page, session);
-        expect(result).toMatchObject({ state: 'unknown', reason: 'probe-rate-limited', httpStatus: 429, endpoint });
+        expect(result).toMatchObject({ state: 'unknown', reason: 'probe-deferred', cause: 'http-429', httpStatus: 429, endpoint });
         expect(Date.parse(result.retryAt) - Date.now()).toBeGreaterThan(115_000);
         const second = pageFor();
         // A freshly imported runtime must see the same persisted cooldown.
         vi.resetModules();
         const fresh = await import('../../web-ai/chatgpt-server-response.mjs');
-        expect(await fresh.readServerResponse(second, session)).toMatchObject({ state: 'unknown', reason: 'probe-rate-limited', retryAt: result.retryAt });
+        expect(await fresh.readServerResponse(second, session)).toMatchObject({ state: 'unknown', reason: 'probe-deferred', cause: 'http-429', retryAt: result.retryAt });
         expect(second.request.get).not.toHaveBeenCalled();
         const control = await readFile(join(home, 'web-ai-server-probe-backoff.json'), 'utf8');
         expect(control).not.toContain('private-test-token');
@@ -75,7 +87,7 @@ describe('optional server probe throttling is not generation failure', () => {
             console.log(JSON.stringify({ result, requests }));
         `], { env: { ...process.env, BROWSER_AGENT_HOME: home }, timeout: 5000 });
         expect(JSON.parse(stdout)).toMatchObject({ requests: 0,
-            result: { state: 'unknown', reason: 'probe-rate-limited', retryAt: first.retryAt } });
+            result: { state: 'unknown', reason: 'probe-deferred', cause: 'http-429', retryAt: first.retryAt } });
     });
 
     it('serializes concurrent probes before the first 429 establishes the cooldown', async () => {
@@ -86,10 +98,39 @@ describe('optional server probe throttling is not generation failure', () => {
         const pending = readServerResponse(first, session);
         await vi.waitFor(() => expect(first.request.get).toHaveBeenCalledTimes(1));
         try {
-            expect(await readServerResponse(second, session)).toMatchObject({ state: 'unknown', reason: 'probe-busy' });
+            expect(await readServerResponse(second, session)).toMatchObject({ state: 'unknown', reason: 'probe-deferred', cause: 'probe-in-flight' });
             expect(second.request.get).not.toHaveBeenCalled();
         } finally { release(); await pending; }
-        expect(await readServerResponse(second, session)).toMatchObject({ state: 'unknown', reason: 'probe-rate-limited' });
+        expect(await readServerResponse(second, session)).toMatchObject({ state: 'unknown', reason: 'probe-deferred', cause: 'http-429' });
         expect(second.request.get).not.toHaveBeenCalled();
+    });
+
+    it('paces successful probes across callers instead of waiting for a 429', async () => {
+        const now = Math.floor(Date.now() / 1000) * 1000;
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+        const first = successfulPage();
+        expect(await readServerResponse(first, session)).toMatchObject({ state: 'complete', answerText: 'done' });
+        expect(first.request.get).toHaveBeenCalledTimes(2);
+
+        const moduleUrl = new URL('../../web-ai/chatgpt-server-response.mjs', import.meta.url).href;
+        const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+            import { readServerResponse } from ${JSON.stringify(moduleUrl)};
+            let requests = 0;
+            const result = await readServerResponse({ url: () => 'https://chatgpt.com/c/conversation-A',
+                request: { get: () => { requests++; throw new Error('must not request'); } } }, ${JSON.stringify(session)});
+            console.log(JSON.stringify({ result, requests }));
+        `], { env: { ...process.env, BROWSER_AGENT_HOME: home }, timeout: 5000 });
+        expect(JSON.parse(stdout)).toMatchObject({ requests: 0,
+            result: { state: 'unknown', reason: 'probe-deferred', cause: 'global-pacing' } });
+
+        const second = successfulPage();
+        const deferred = await readServerResponse(second, session);
+        expect(deferred).toMatchObject({ state: 'unknown', reason: 'probe-deferred', cause: 'global-pacing' });
+        expect(Date.parse(deferred.retryAt)).toBeGreaterThan(now);
+        expect(second.request.get).not.toHaveBeenCalled();
+
+        clock.mockReturnValue(Date.parse(deferred.retryAt) + 1);
+        expect(await readServerResponse(second, session)).toMatchObject({ state: 'complete', answerText: 'done' });
+        expect(second.request.get).toHaveBeenCalledTimes(2);
     });
 });

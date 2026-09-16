@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSession, updateSession, getSession, beginSessionGeneration } from '../../web-ai/session.mjs';
@@ -84,7 +84,7 @@ describe('poll recovers a completed background response', () => {
         expect(result).toMatchObject({ status: 'awaiting-response', errorCode: 'poll.wait-expired',
             terminal: false, retryHint: 'poll-or-resume', recoverable: true,
             sessionId: session.sessionId });
-        expect(result.warnings).toContain('server-probe-rate-limited');
+        expect(result.warnings).toContain('server-probe-deferred');
         expect(result.warnings).not.toContain('provider-rate-limited');
         expect(getSession(session.sessionId)).toEqual(session);
     });
@@ -114,10 +114,59 @@ describe('poll recovers a completed background response', () => {
             continuationObservation: prior });
 
         expect(result).toMatchObject({ status: 'polling', terminal: false, progressVerified: true,
-            providerState: 'generating', serverProbe: { reason: 'probe-rate-limited' } });
-        expect(result.warnings).toContain('server-probe-rate-limited');
+            providerState: 'generating', serverProbe: { reason: 'probe-deferred', cause: 'http-429' } });
+        expect(result.warnings).toContain('server-probe-deferred');
         expect(result.warnings).not.toContain('provider-rate-limited');
         expect(result.providerObservation.lastProgressAt).toBe(prior.lastProgressAt);
+    });
+
+    it('starts one bounded wait for a new exact request when its first probe is throttled but strong activity is visible', async () => {
+        const { session, deps, page } = setup({ terminal: false });
+        page.request.get.mockResolvedValue({ status: () => 429,
+            headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
+        page.locator = () => ({ first: () => ({ isVisible: async () => true }), all: async () => [], count: async () => 0 });
+        page.evaluate.mockImplementation(async (fn) => {
+            const source = String(fn);
+            if (source.startsWith('function readAssistantSnapshotSources')) return {
+                ok: true, userAnchorFound: true, responseAnchorFound: false, wrapped: [], wrapperless: [] };
+            if (source.startsWith('function readAssistantTurnOrderingInPage')) return 'ordered';
+            if (source.startsWith('function readChatGptStreamingState')) return { strength: 'strong', evidence: 'stop-button' };
+            return null;
+        });
+
+        const result = await pollWebAi(deps, { session: session.sessionId, timeout: 0.15 });
+
+        expect(result).toMatchObject({ status: 'polling', terminal: false, progressVerified: true,
+            providerState: 'generating', serverProbe: { reason: 'probe-deferred', cause: 'http-429' } });
+        expect(result.warnings).toContain('server-probe-deferred');
+        expect(result.warnings).not.toContain('provider-rate-limited');
+        expect(result.providerObservation).toMatchObject({ source: 'dom', state: 'generating', progressVerified: true });
+        expect(Number.isFinite(Date.parse(result.providerObservation.lastProgressAt))).toBe(true);
+        expect(getSession(session.sessionId)).toMatchObject({ generation: session.generation,
+            submittedUserMessageId: session.submittedUserMessageId, answer: null });
+    });
+
+    it('keeps polling when another process globally paced the optional probe', async () => {
+        const { session, deps, page } = setup({ terminal: false });
+        const retryAt = new Date(Date.now() + 60_000).toISOString();
+        writeFileSync(join(home, 'web-ai-server-probe-backoff.json'), JSON.stringify({ version: 1, nextProbeAt: retryAt }));
+        page.locator = () => ({ first: () => ({ isVisible: async () => true }), all: async () => [], count: async () => 0 });
+        page.evaluate.mockImplementation(async (fn) => {
+            const source = String(fn);
+            if (source.startsWith('function readAssistantSnapshotSources')) return {
+                ok: true, userAnchorFound: true, responseAnchorFound: false, wrapped: [], wrapperless: [] };
+            if (source.startsWith('function readAssistantTurnOrderingInPage')) return 'ordered';
+            if (source.startsWith('function readChatGptStreamingState')) return { strength: 'strong', evidence: 'stop-button' };
+            return null;
+        });
+
+        const result = await pollWebAi(deps, { session: session.sessionId, timeout: 0.15 });
+
+        expect(result).toMatchObject({ status: 'polling', terminal: false, progressVerified: true,
+            providerState: 'generating', serverProbe: { reason: 'probe-deferred', cause: 'global-pacing', retryAt } });
+        expect(result.warnings).toContain('server-probe-deferred');
+        expect(result.warnings).not.toContain('provider-rate-limited');
+        expect(page.request.get).not.toHaveBeenCalled();
     });
 
     it('still ages out a stale stop button after throttled server recovery', async () => {
@@ -167,7 +216,7 @@ describe('poll recovers a completed background response', () => {
         });
         const result = await pollWebAi(deps, { session: session.sessionId, timeout: 30, skipFinalize: true });
         expect(result).toMatchObject({ status: 'complete', answerText: sample.text });
-        expect(result.warnings).toContain('server-probe-rate-limited');
+        expect(result.warnings).toContain('server-probe-deferred');
         expect(page.request.get).toHaveBeenCalledTimes(1);
         expect(page.bringToFront).not.toHaveBeenCalled();
     });
@@ -179,7 +228,7 @@ describe('poll recovers a completed background response', () => {
             headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
         const paused = await pollWebAi(deps, { session: session.sessionId, timeout: 0.15 });
         expect(paused).toMatchObject({ status: 'awaiting-response', terminal: false,
-            serverProbe: { reason: 'probe-rate-limited', endpoint: 'auth-session', httpStatus: 429 } });
+            serverProbe: { reason: 'probe-deferred', cause: 'http-429', endpoint: 'auth-session', httpStatus: 429 } });
         expect(getSession(session.sessionId)).toEqual(session);
         vi.spyOn(Date, 'now').mockReturnValue(Date.parse(paused.serverProbe.retryAt) + 1);
         page.request.get.mockImplementation(get);
@@ -198,9 +247,24 @@ describe('poll recovers a completed background response', () => {
         page.locator = () => ({ first: () => ({ isVisible: async () => true }) });
         const result = await statusWebAi(deps, { session: session.sessionId });
         expect(result).toMatchObject({ ok: true, status: 'ready', providerState: 'unknown',
-            responseAvailable: null, providerObservationReason: 'probe-rate-limited',
-            warnings: ['server-probe-rate-limited'] });
+            responseAvailable: null, providerObservationReason: 'probe-deferred',
+            warnings: ['server-probe-deferred'] });
         expect(Date.parse(result.serverProbeRetryAt)).toBeGreaterThan(Date.now());
+        expect(getSession(session.sessionId)).toEqual(session);
+    });
+
+    it('status reports globally paced probes as deferred, not provider-blocked', async () => {
+        const { session, deps, page } = setup();
+        const retryAt = new Date(Date.now() + 60_000).toISOString();
+        writeFileSync(join(home, 'web-ai-server-probe-backoff.json'), JSON.stringify({ version: 1, nextProbeAt: retryAt }));
+        page.locator = () => ({ first: () => ({ isVisible: async () => true }) });
+
+        const result = await statusWebAi(deps, { session: session.sessionId });
+
+        expect(result).toMatchObject({ ok: true, status: 'ready', providerState: 'unknown',
+            responseAvailable: null, providerObservationReason: 'probe-deferred',
+            serverProbeRetryAt: retryAt, warnings: ['server-probe-deferred'] });
+        expect(page.request.get).not.toHaveBeenCalled();
         expect(getSession(session.sessionId)).toEqual(session);
     });
     it('continues only with fresh progress and does not carry it through a failed browser probe', async () => {

@@ -346,10 +346,12 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         if (sessionGeneration(refreshed) !== generation) {
             return supersededWatchTick(session, vendor, generation);
         }
+        const continuingAwait = pollResult.status === 'awaiting-response'
+            && !isDeadlineExpired(refreshed.deadlineAt || session.deadlineAt);
         let status = pollResult?.errorCode === 'provider.interstitial'
             ? 'blocked'
             : pollResult.status === 'awaiting-response'
-                ? (isDeadlineExpired(refreshed.deadlineAt) ? 'awaiting-response' : 'polling')
+                ? (continuingAwait ? 'polling' : 'awaiting-response')
             : pollResult.progressVerified === true ? 'polling'
             : refreshed.status || pollResult.status || 'polling';
         /** @type {string[]} */
@@ -376,7 +378,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         if (observed === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
 
         return {
-            ok: pollResult.ok !== false,
+            ok: continuingAwait || pollResult.ok !== false,
             sessionId: session.sessionId,
             vendor,
             status,
@@ -389,13 +391,14 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             // stage, hint and evidence turned a fail-closed poll result into an
             // ordinary non-terminal tick, which is the silence the contract
             // exists to remove.
-            ...(pollResult.errorCode ? { errorCode: pollResult.errorCode } : {}),
-            ...(pollResult.stage ? { stage: pollResult.stage } : {}),
-            ...(pollResult.retryHint ? { retryHint: pollResult.retryHint } : {}),
-            ...(pollResult.evidence ? { evidence: pollResult.evidence } : {}),
+            ...(!continuingAwait && pollResult.errorCode ? { errorCode: pollResult.errorCode } : {}),
+            ...(!continuingAwait && pollResult.stage ? { stage: pollResult.stage } : {}),
+            ...(!continuingAwait && pollResult.retryHint ? { retryHint: pollResult.retryHint } : {}),
+            ...(!continuingAwait && pollResult.evidence ? { evidence: pollResult.evidence } : {}),
             ...(pollResult.artifacts ? { artifacts: pollResult.artifacts } : {}),
+            ...(pollResult.serverProbe ? { serverProbe: pollResult.serverProbe } : {}),
             ...(pollResult.providerState ? { providerState: pollResult.providerState, progressVerified: pollResult.progressVerified === true,
-                waitExpired: pollResult.waitExpired === true, recoverable: pollResult.recoverable === true } : {}),
+                waitExpired: continuingAwait ? false : pollResult.waitExpired === true, recoverable: pollResult.recoverable === true } : {}),
             preflight,
             profileLock: profileLockSummary,
         };

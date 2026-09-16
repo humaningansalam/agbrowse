@@ -136,19 +136,26 @@ The text recovery path does not satisfy required file/image capture and reports
 `file-artifacts-not-probed-server-recovery` rather than borrowing old DOM files.
 
 An HTTP 429 from the optional auth/conversation GET is **not** a ChatGPT
-generation block. It produces `server-probe-rate-limited`; exact-turn DOM
-observation and answer capture continue. The probe respects `Retry-After`
-(at least 60 seconds), with a cooldown shared by CLI processes under the same
-`BROWSER_AGENT_HOME`. Do not restart the command or send a new prompt to evade
-that cooldown. Real visible rate-limit dialogs still return `blocked`.
-When the exact request already has fresh verified server progress and the
-current DOM still shows strong generation activity, a deferred probe does not
-end `query`/`poll`; the same session keeps waiting. The DOM signal does not
-refresh the server-progress timestamp, so a stale stop control still ages out
-after five minutes instead of creating an endless wait.
+generation block. It produces neutral `probe-deferred` state with
+`serverProbe.cause: http-429`; exact-turn DOM observation and answer capture
+continue. The probe respects `Retry-After`
+(at least 60 seconds). CLI processes under the same `BROWSER_AGENT_HOME` also
+share one in-flight reservation and a 15-second minimum interval after every
+attempted probe, so successful callers cannot stampede the endpoint before a
+429 appears. Normal pacing is `probe-deferred`/`server-probe-deferred`, not a
+provider block. Do not restart the command or send a new prompt to evade either
+cooldown. Real visible rate-limit dialogs still return `blocked`.
+When the exact request's current DOM shows strong generation activity, a
+deferred first probe starts one bounded progress window instead of ending a
+brand-new `query`/`poll`; fresh verified progress is preserved the same way.
+The DOM signal does not refresh that timestamp, so a stale stop control still
+ages out after five minutes instead of creating an endless wait.
 An unverified `status --session` reports `responseAvailable: null`, not proof
 that there is no answer. A wait may end with `awaiting-response` and diagnostic
 `serverProbe.retryAt`; keep the same ID for the next poll/resume.
+`watch` treats an exhausted short poll slice before the stored deadline as a
+clean `polling` tick without forwarding `poll.wait-expired`; it keeps the same
+session running until completion, a real provider block, or the stored deadline.
 
 | Long-running tier | Default `--timeout` | Roughly |
 | --- | ---: | --- |

@@ -94,23 +94,28 @@ change for five minutes becomes unverified, not a forced provider cancellation.
 `awaiting-response` with `errorCode: poll.wait-expired`, `terminal: false`, `waitExpired: true`, and
 `retryHint: poll-or-resume` ends a wait whose completion/progress is unverified.
 It must not be translated into “GPT has no answer.” A watcher before its stored
-deadline can keep observing; after expiry it exits with `watch.awaiting-response`
-unless progress is verified. `status --session` exposes `providerState` and
+deadline converts an exhausted short poll slice into a clean `polling` tick—no
+failure code—then keeps observing. After expiry it exits with
+`watch.awaiting-response` unless progress is verified. `status --session` exposes `providerState` and
 `responseAvailable`; `sessions show` remains a read-only persisted snapshot.
 Only an actual visible rate-limit dialog is a recoverable provider block.
-HTTP 429 from the optional auth/conversation GET is `server-probe-rate-limited`,
-not proof of a stopped generation. Poll continues exact-turn DOM capture while
-the probe honors `Retry-After` (at least 60 seconds). A separate control file,
-`web-ai-server-probe-backoff.json`, shares the cooldown and an in-flight probe
-reservation across processes in the same `BROWSER_AGENT_HOME`; it stores no
+HTTP 429 from the optional auth/conversation GET is reported as a neutral
+`probe-deferred` observation with `cause: http-429`, not proof of a stopped
+generation. Poll continues exact-turn DOM capture while the probe honors
+`Retry-After` (at least 60 seconds). A separate control file,
+`web-ai-server-probe-backoff.json`, shares the cooldown, an in-flight probe
+reservation, and a 15-second minimum interval after every attempted probe across
+processes in the same `BROWSER_AGENT_HOME`. A caller inside that normal interval
+gets `probe-deferred`/`server-probe-deferred`, not a synthetic provider block. The file stores no
 credentials, conversation IDs, or answer content. Session records are unchanged
 by the throttle. `status --session` reports `responseAvailable: null` for an
 unverified probe and exposes `serverProbeRetryAt`. Wait results may include
 `serverProbe.retryAt`; callers retain the same session and must not resend.
-If that exact request already has fresh verified server progress and the current
-DOM still reports strong generation activity, the throttled probe does not end
-the wait. The DOM observation preserves—but never refreshes—the server progress
-timestamp, so a stale stop control still becomes unverified after five minutes.
+If that exact request's current DOM reports strong generation activity, a
+throttled first probe starts one bounded progress window rather than ending a
+new wait; fresh verified progress is preserved the same way. The DOM observation
+never refreshes that timestamp, so a stale stop control still becomes
+unverified after five minutes.
 
 Target ownership is acquired before page binding/recovery and explicit poll/resume/watch
 deadline updates. Async-local lease context separates concurrent callers from

@@ -114,6 +114,69 @@ describe('watch reconciles an exact request beyond its stored deadline', () => {
         expect(pollState.impl).toHaveBeenCalledTimes(1);
         expect(getSession(session.sessionId)).toMatchObject({ status: 'polling', answer: null });
     });
+
+    it('keeps a pre-deadline server-probe throttle as a clean polling tick', async () => {
+        const session = createWatcherSession({ deadlineAt: new Date(Date.now() + 60_000).toISOString() });
+        updateSession(session.sessionId, { submittedUserMessageId: 'user-1' });
+        const retryAt = new Date(Date.now() + 30_000).toISOString();
+        pollState.impl = vi.fn(async () => ({
+            ok: false,
+            status: 'awaiting-response',
+            providerState: 'unknown',
+            progressVerified: false,
+            waitExpired: true,
+            recoverable: true,
+            errorCode: 'poll.wait-expired',
+            stage: 'poll-wait',
+            retryHint: 'poll-or-resume',
+            error: 'optional server probe unavailable',
+            warnings: ['server-probe-deferred'],
+            serverProbe: { reason: 'probe-deferred', cause: 'http-429', retryAt },
+        }));
+
+        const result = await watchSessionOnce(baseDeps(), { session: session.sessionId, pollTimeoutSec: 30 });
+
+        expect(result).toMatchObject({
+            ok: true,
+            status: 'polling',
+            terminal: false,
+            providerState: 'unknown',
+            progressVerified: false,
+            serverProbe: { reason: 'probe-deferred', cause: 'http-429', retryAt },
+        });
+        expect(result.errorCode).toBeUndefined();
+        expect(result.stage).toBeUndefined();
+        expect(result.retryHint).toBeUndefined();
+        expect(result.error).toBeUndefined();
+    });
+
+    it('continues watching through a pre-deadline probe throttle and later completes', async () => {
+        const session = createWatcherSession({ deadlineAt: new Date(Date.now() + 60_000).toISOString() });
+        updateSession(session.sessionId, { submittedUserMessageId: 'user-1' });
+        let count = 0;
+        pollState.impl = vi.fn(async () => {
+            if (++count === 1) return {
+                ok: false,
+                status: 'awaiting-response',
+                providerState: 'unknown',
+                errorCode: 'poll.wait-expired',
+                stage: 'poll-wait',
+                retryHint: 'poll-or-resume',
+                warnings: ['server-probe-deferred'],
+                serverProbe: { reason: 'probe-deferred', retryAt: new Date(Date.now() + 10_000).toISOString() },
+            };
+            updateSession(session.sessionId, { status: 'complete', answer: 'done', completedAt: new Date().toISOString() });
+            return { ok: true, status: 'complete', answerText: 'done' };
+        });
+        const events = [];
+
+        const result = await watchSession(baseDeps(), { session: session.sessionId, intervalMs: 1 }, async event => events.push(event));
+
+        expect(result).toMatchObject({ ok: true, status: 'complete' });
+        expect(count).toBe(2);
+        expect(events.filter(event => event.type === 'watch.tick')[0]).toMatchObject({ status: 'polling', terminal: false });
+        expect(events.some(event => event.type === 'watch.awaiting-response')).toBe(false);
+    });
 });
 
 describe('web-ai watcher self-heals drifted conversation URL (source-string contract)', () => {

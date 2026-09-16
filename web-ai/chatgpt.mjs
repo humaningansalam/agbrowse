@@ -216,7 +216,7 @@ export async function statusWebAi(deps, input = {}) {
             responseMessageId: server.responseMessageId || null, responseChars: server.answerText?.length || 0,
             providerObservationReason: server.reason || null,
             ...(server.retryAt ? { serverProbeRetryAt: server.retryAt } : {}) } : {}),
-        warnings: server?.reason === 'probe-rate-limited' ? ['server-probe-rate-limited'] : [],
+        warnings: server?.reason === 'probe-deferred' ? ['server-probe-deferred'] : [],
     };
 }
 
@@ -1038,10 +1038,12 @@ async function reconcileServerAnswer(deps, input, session, page, stillActive, pr
     if (!await isSessionGenerationCurrent(session.sessionId, expectedGeneration)) {
         return buildGenerationSupersededResult('chatgpt', session, expectedGeneration);
     }
-    if (proof.reason === 'probe-rate-limited') {
-        observations.add('server-probe-rate-limited');
+    if (proof.reason === 'probe-deferred') {
+        observations.add('server-probe-deferred');
         progress.probeDeferred = { reason: proof.reason, endpoint: proof.endpoint,
-            httpStatus: proof.httpStatus, retryAt: proof.retryAt };
+            cause: proof.cause, httpStatus: proof.httpStatus, retryAt: proof.retryAt };
+    } else {
+        progress.probeDeferred = null;
     }
     // An optional GET failing is not a ChatGPT dialog, nor proof that the
     // submitted request failed. Continue exact-turn DOM observation/capture.
@@ -1319,6 +1321,10 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
             nextServerProbeAt = Date.now() + 15_000;
             const serverResult = await reconcileServerAnswer(deps, { ...input, generation: expectedGeneration }, session, page, isActiveRun, progress, observations);
             if (serverResult) return serverResult;
+            const deferredUntil = Date.parse(progress.probeDeferred?.retryAt || '');
+            if (Number.isFinite(deferredUntil) && deferredUntil > nextServerProbeAt) {
+                nextServerProbeAt = deferredUntil;
+            }
         }
         let identityOk = true;
         if (session?.targetId) {
@@ -1506,6 +1512,9 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         // longer quiet period before we accept completion.
         const streaming = activity.strength === 'strong';
         const priorObservation = progress.observation || input.continuationObservation;
+        const priorLastProgressMs = Date.parse(priorObservation?.lastProgressAt || '');
+        const priorProgressFresh = Number.isFinite(priorLastProgressMs)
+            && Date.now() - priorLastProgressMs < 5 * 60_000;
         if (progress.eligible && identityOk && latest && progress.observation?.source !== 'conversation') {
             progress.observedThisCall = true;
             progress.observation = mergeServerObservation(priorObservation, {
@@ -1526,6 +1535,27 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
                 state: 'generating',
                 observedAt: new Date().toISOString(),
             });
+        } else if (progress.eligible && identityOk && streaming
+            && progress.probeDeferred?.reason === 'probe-deferred'
+            && (!priorObservation || (priorProgressFresh && Boolean(priorObservation.fingerprint)))) {
+            // The first optional server probe may be throttled because another
+            // session established a shared cooldown. Exact user correlation
+            // plus a strong, current DOM generation signal buys one bounded
+            // progress window so a brand-new query does not stop on that 429.
+            // Preserve an existing timestamp when present; subsequent slices
+            // cannot refresh it, so a stale stop control still ages out.
+            const observedAt = new Date().toISOString();
+            progress.observedThisCall = true;
+            progress.observation = {
+                ...(priorObservation || {}),
+                source: priorObservation?.source || 'dom',
+                state: 'generating',
+                fingerprint: priorObservation?.fingerprint
+                    || `activity:${session?.sessionId || ''}:${expectedGeneration}:${submittedUserMessageId || submittedUserTurnId || ''}:${activity.evidence || 'strong'}`,
+                observedAt,
+                lastProgressAt: priorProgressFresh ? priorObservation.lastProgressAt : observedAt,
+                progressVerified: true,
+            };
         }
         // An unobserved verdict buys the same longer quiet window as weak
         // activity: we cannot claim the page went quiet if we could not read it.

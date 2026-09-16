@@ -8,6 +8,7 @@ import { withPollDeadline } from './poll-deadline.mjs';
 import { withStoreLockAsync } from './session-store.mjs';
 
 const HOSTS = new Set(['chatgpt.com', 'chat.openai.com']);
+const MIN_SERVER_PROBE_INTERVAL_MS = 15_000;
 
 /** A throttled diagnostic GET says nothing about the submitted generation. */
 function throttledProbe(response, endpoint) {
@@ -17,8 +18,8 @@ function throttledProbe(response, endpoint) {
     const hinted = /^\d+$/.test(raw) ? now + Number(raw) * 1000
         : /[a-z]/i.test(raw) ? Date.parse(raw) : NaN;
     const retryMs = Number.isFinite(hinted) && hinted <= 8.64e15 ? Math.max(now + 60_000, hinted) : now + 60_000;
-    return { state: 'unknown', source: 'conversation', reason: 'probe-rate-limited',
-        httpStatus: 429, endpoint, retryAt: new Date(retryMs).toISOString() };
+    return { state: 'unknown', source: 'conversation', reason: 'probe-deferred',
+        cause: 'http-429', httpStatus: 429, endpoint, retryAt: new Date(retryMs).toISOString() };
 }
 
 /**
@@ -52,11 +53,16 @@ async function withServerProbeBackoff(probe, timeoutMs) {
         const deferred = await withStoreLockAsync(async () => {
             const state = await read();
             if (Date.parse(state.retryAt || '') > Date.now()) return {
-                state: 'unknown', source: 'conversation', reason: 'probe-rate-limited',
+                state: 'unknown', source: 'conversation', reason: 'probe-deferred', cause: 'http-429',
                 httpStatus: 429, endpoint: state.endpoint, retryAt: state.retryAt,
             };
             if (Date.parse(state.leaseUntil || '') > Date.now()) return {
-                state: 'unknown', source: 'conversation', reason: 'probe-busy', retryAt: state.leaseUntil,
+                state: 'unknown', source: 'conversation', reason: 'probe-deferred',
+                cause: 'probe-in-flight', retryAt: state.leaseUntil,
+            };
+            if (Date.parse(state.nextProbeAt || '') > Date.now()) return {
+                state: 'unknown', source: 'conversation', reason: 'probe-deferred',
+                cause: 'global-pacing', retryAt: state.nextProbeAt,
             };
             await write({ version: 1, leaseId, leaseUntil: new Date(Date.now() + Math.max(30_000, timeoutMs * 3)).toISOString() });
             reserved = true;
@@ -71,9 +77,9 @@ async function withServerProbeBackoff(probe, timeoutMs) {
         if (reserved) await withStoreLockAsync(async () => {
             // A timed-out/crashed predecessor must not release a newer lease.
             if ((await read()).leaseId !== leaseId) return;
-            await write(result?.reason === 'probe-rate-limited'
+            await write(result?.cause === 'http-429'
                 ? { version: 1, retryAt: result.retryAt, endpoint: result.endpoint }
-                : { version: 1 });
+                : { version: 1, nextProbeAt: new Date(Date.now() + MIN_SERVER_PROBE_INTERVAL_MS).toISOString() });
         }).catch(() => {});
     }
 }
