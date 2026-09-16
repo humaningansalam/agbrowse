@@ -107,6 +107,10 @@ credentials, conversation IDs, or answer content. Session records are unchanged
 by the throttle. `status --session` reports `responseAvailable: null` for an
 unverified probe and exposes `serverProbeRetryAt`. Wait results may include
 `serverProbe.retryAt`; callers retain the same session and must not resend.
+If that exact request already has fresh verified server progress and the current
+DOM still reports strong generation activity, the throttled probe does not end
+the wait. The DOM observation preserves—but never refreshes—the server progress
+timestamp, so a stale stop control still becomes unverified after five minutes.
 
 Target ownership is acquired before page binding/recovery and explicit poll/resume/watch
 deadline updates. Async-local lease context separates concurrent callers from

@@ -24,18 +24,18 @@ aliases: [agbrowse source map, agbrowse str_func, agbrowse 파일 구조]
 | `skills/browser/` | 58 | 17278 | Chrome lifecycle, CDP connection, refs, tabs, diagnostics, adaptive fetch v2, search orchestrator, Runway task-runner preflight/poll |
 | `skills/search/` | 5 | 896 | standalone search skill doc (any CLI agent) |
 | `skills/vision-click/` | 4 | 1215 | screenshot to coordinate click helper |
-| `skills/web-ai/` | 3 | 961 | bundled agent workflow skill |
-| `web-ai/` | 123 | 36619 | provider automation, sessions, MCP, eval, policy, trace |
+| `skills/web-ai/` | 3 | 966 | bundled agent workflow skill |
+| `web-ai/` | 123 | 36633 | provider automation, sessions, MCP, eval, policy, trace |
 | `web-ai/context-pack/` | 10 | 1821 | file selection, token budget, context rendering |
 | `web-ai/eval/` | 5 | 553 | offline provider DOM fixture harness |
 | `web-ai/policy/` | 4 | 297 | mutation and content-boundary guardrails |
 | `web-ai/trace/` | 5 | 444 | trace ID, redaction, report, writer helpers |
 | `scripts/` | 14 | 2478 | eval runner, release scripts, named release gates, strict-baseline / module-graph / bin smoke checks |
-| `test/unit/` | 180 | 31516 | deterministic module tests |
+| `test/unit/` | 180 | 31575 | deterministic module tests |
 | `test/integration/` | 28 | 6019 | CLI, MCP, policy, provider fixture tests |
 | `test/e2e/` | 1 | 50 | browser smoke coverage |
 | `test/spec/` | 2 | 35 | high-level contract specs |
-| `docs/` | 42 | 4144 | adoption, trace, production-readiness, comparison, benchmark, EXTERNAL_CDP, migration docs, GitHub Pages developer docs |
+| `docs/` | 42 | 4148 | adoption, trace, production-readiness, comparison, benchmark, EXTERNAL_CDP, migration docs, GitHub Pages developer docs |
 | `devlog/` | 662 | 95881 | phased plan, research, implementation notes (incl. strict-migration phases) |
 
 `structure/` 자체는 이 문서가 검증 대상으로 삼는 source tree 밖의 문서 허브라서 위 집계에서 제외한다. `verify-counts.sh`는 이 표의 경로별 파일 수와 라인 수를 live source 기준으로 비교한다.
@@ -82,7 +82,7 @@ aliases: [agbrowse source map, agbrowse str_func, agbrowse 파일 구조]
 | `skills/browser/adaptive-fetch/browser-runtime.mjs` | 38 | browser page acquisition and cleanup |
 | `web-ai/cli.mjs` | 2211 | `web-ai` subcommand parser and strict session-to-target command orchestration |
 | `web-ai/session-target-guard.mjs` | 69 | target-mismatch recovery envelopes for an explicitly identified session |
-| `web-ai/chatgpt.mjs` | 2938 | ChatGPT provider send/poll/query/status with streaming-safe recovery gates |
+| `web-ai/chatgpt.mjs` | 2952 | ChatGPT provider send/poll/query/status with streaming-safe recovery gates |
 | `web-ai/chatgpt-response-dom.mjs` | 674 | shared ChatGPT assistant DOM extraction plus the Node-side composer-scoped stop probe |
 | `web-ai/chatgpt-response-observer.mjs` | 200 | ChatGPT observer wake signal and timeout recovery metadata |
 | `web-ai/gemini-live.mjs` | 1107 | Gemini provider send/poll/query/status |

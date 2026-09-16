@@ -1505,11 +1505,25 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         // trace — no longer freezes the stability window; it only demands a
         // longer quiet period before we accept completion.
         const streaming = activity.strength === 'strong';
+        const priorObservation = progress.observation || input.continuationObservation;
         if (progress.eligible && identityOk && latest && progress.observation?.source !== 'conversation') {
             progress.observedThisCall = true;
-            progress.observation = mergeServerObservation(progress.observation || input.continuationObservation, {
+            progress.observation = mergeServerObservation(priorObservation, {
                 source: 'dom', state: streaming ? 'generating' : 'pending',
                 fingerprint: `${latestSnapshot?.messageId || ''}:${createHash('sha256').update(latest).digest('hex')}`,
+                observedAt: new Date().toISOString(),
+            });
+        } else if (progress.eligible && identityOk && streaming && priorObservation?.progressVerified === true) {
+            // A throttled/busy optional server probe must not erase progress
+            // already tied to this exact request when THIS call can still see
+            // strong live-generation evidence. Reusing the prior fingerprint
+            // deliberately does not refresh `lastProgressAt`: a stale stop
+            // button therefore ages out after the normal five-minute window
+            // instead of keeping the query alive forever.
+            progress.observedThisCall = true;
+            progress.observation = mergeServerObservation(priorObservation, {
+                ...priorObservation,
+                state: 'generating',
                 observedAt: new Date().toISOString(),
             });
         }

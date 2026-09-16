@@ -141,6 +141,11 @@ observation and answer capture continue. The probe respects `Retry-After`
 (at least 60 seconds), with a cooldown shared by CLI processes under the same
 `BROWSER_AGENT_HOME`. Do not restart the command or send a new prompt to evade
 that cooldown. Real visible rate-limit dialogs still return `blocked`.
+When the exact request already has fresh verified server progress and the
+current DOM still shows strong generation activity, a deferred probe does not
+end `query`/`poll`; the same session keeps waiting. The DOM signal does not
+refresh the server-progress timestamp, so a stale stop control still ages out
+after five minutes instead of creating an endless wait.
 An unverified `status --session` reports `responseAvailable: null`, not proof
 that there is no answer. A wait may end with `awaiting-response` and diagnostic
 `serverProbe.retryAt`; keep the same ID for the next poll/resume.

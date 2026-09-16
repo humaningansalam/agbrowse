@@ -89,6 +89,65 @@ describe('poll recovers a completed background response', () => {
         expect(getSession(session.sessionId)).toEqual(session);
     });
 
+    it('keeps the same request polling through a throttled probe while strong live activity is visible', async () => {
+        const { session, deps, page } = setup({ terminal: false });
+        const now = Date.now();
+        const prior = {
+            source: 'conversation', conversationId: 'conv-owned', submittedUserMessageId: 'user-owned',
+            currentNode: 'response-owned', fingerprint: 'verified-server-progress',
+            observedAt: new Date(now).toISOString(), lastProgressAt: new Date(now).toISOString(),
+            state: 'generating', progressVerified: true,
+        };
+        page.request.get.mockResolvedValue({ status: () => 429,
+            headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
+        page.locator = () => ({ first: () => ({ isVisible: async () => true }), all: async () => [], count: async () => 0 });
+        page.evaluate.mockImplementation(async (fn) => {
+            const source = String(fn);
+            if (source.startsWith('function readAssistantSnapshotSources')) return {
+                ok: true, userAnchorFound: true, responseAnchorFound: false, wrapped: [], wrapperless: [] };
+            if (source.startsWith('function readAssistantTurnOrderingInPage')) return 'ordered';
+            if (source.startsWith('function readChatGptStreamingState')) return { strength: 'strong', evidence: 'stop-button' };
+            return null;
+        });
+
+        const result = await pollWebAi(deps, { session: session.sessionId, timeout: 0.15,
+            continuationObservation: prior });
+
+        expect(result).toMatchObject({ status: 'polling', terminal: false, progressVerified: true,
+            providerState: 'generating', serverProbe: { reason: 'probe-rate-limited' } });
+        expect(result.warnings).toContain('server-probe-rate-limited');
+        expect(result.warnings).not.toContain('provider-rate-limited');
+        expect(result.providerObservation.lastProgressAt).toBe(prior.lastProgressAt);
+    });
+
+    it('still ages out a stale stop button after throttled server recovery', async () => {
+        const { session, deps, page } = setup({ terminal: false });
+        const now = Date.now();
+        const prior = {
+            source: 'conversation', conversationId: 'conv-owned', submittedUserMessageId: 'user-owned',
+            currentNode: 'response-owned', fingerprint: 'stale-server-progress',
+            observedAt: new Date(now - 301_000).toISOString(), lastProgressAt: new Date(now - 301_000).toISOString(),
+            state: 'generating', progressVerified: true,
+        };
+        page.request.get.mockResolvedValue({ status: () => 429,
+            headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
+        page.locator = () => ({ first: () => ({ isVisible: async () => true }), all: async () => [], count: async () => 0 });
+        page.evaluate.mockImplementation(async (fn) => {
+            const source = String(fn);
+            if (source.startsWith('function readAssistantSnapshotSources')) return {
+                ok: true, userAnchorFound: true, responseAnchorFound: false, wrapped: [], wrapperless: [] };
+            if (source.startsWith('function readAssistantTurnOrderingInPage')) return 'ordered';
+            if (source.startsWith('function readChatGptStreamingState')) return { strength: 'strong', evidence: 'stop-button' };
+            return null;
+        });
+
+        const result = await pollWebAi(deps, { session: session.sessionId, timeout: 0.15,
+            continuationObservation: prior });
+
+        expect(result).toMatchObject({ status: 'awaiting-response', terminal: false,
+            progressVerified: false, errorCode: 'poll.wait-expired' });
+    });
+
     it('still captures an exact DOM final while the optional server probe is throttled', async () => {
         const { session, deps, page } = setup();
         page.request.get.mockResolvedValue({ status: () => 429, headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
