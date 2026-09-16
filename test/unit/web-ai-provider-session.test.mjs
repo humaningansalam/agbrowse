@@ -422,15 +422,14 @@ describe('web-ai cli session flags', () => {
     it('wraps MCP wait/resume in session command lock, session page recovery, and MCP active command', () => {
         const mcpSrc = readFileSync(join(process.cwd(), 'web-ai/mcp-server.mjs'), 'utf8');
         expect(mcpSrc).toContain("import { withSessionCommandLock } from './session-store.mjs'");
-        // The guarded form threads the stored-deadline predicate into the
-        // recovery writes; the plain form would let a binding write land after
-        // the session's own deadline passed while the store lock was waited on.
+        // Legacy providers keep their stored-deadline guard. Exact ChatGPT
+        // generations instead get bounded reconciliation after wait expiry.
         expect(mcpSrc).toContain("import { storedDeadlineStillActive, withSessionPageGuarded } from './tab-recovery.mjs'");
         expect(mcpSrc).toMatch(/if \(name === 'web_ai_wait_response' \|\| name === 'web_ai_session_resume'\) \{[\s\S]*?return runMcpSessionPoll\(name, args, deps\)/);
         expect(mcpSrc).toMatch(/async function runMcpSessionPoll\(name, args, deps\)/);
         expect(mcpSrc).toMatch(/withSessionCommandLock\(sessionId/);
         expect(mcpSrc).toMatch(/withSessionPageGuarded\(deps, sessionId/);
-        expect(mcpSrc).toMatch(/stillActive: storedDeadlineStillActive\(stored\)/);
+        expect(mcpSrc).toMatch(/stillActive: canReconcileChatGptSession\(stored\) \? undefined : storedDeadlineStillActive\(stored\)/);
         expect(mcpSrc).toMatch(/withMcpActiveCommand\(name, provider, sessionDeps, sessionArgs/);
     });
 

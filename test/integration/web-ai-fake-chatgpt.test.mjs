@@ -147,7 +147,7 @@ describe('web-ai fake ChatGPT fixture', () => {
     it('returns deferred unverified when completion evaluation fails in a session', async () => {
         const page = createFakeChatGptPage({ failCompletionEvaluate: true });
         const result = await runFakeQuery(page, { timeout: 1 });
-        expect(result.status).toBe('polling');
+        expect(result).toMatchObject({ status: 'awaiting-response', terminal: false, progressVerified: false });
         expect(result.warnings).toContain('recovery-deferred-unverified');
     });
 
@@ -173,14 +173,14 @@ describe('web-ai fake ChatGPT fixture', () => {
     it('returns deferred streaming recovery for the sampled response', async () => {
         const page = createFakeChatGptPage({ streaming: true });
         const result = await runFakeQuery(page, { timeout: 1 });
-        expect(result.status).toBe('polling');
+        expect(result).toMatchObject({ status: 'awaiting-response', terminal: false, progressVerified: false });
         expect(result.warnings).toContain('recovery-deferred-streaming');
     });
 
     it('does not complete copy-markdown timeout fallback without correlated controls', async () => {
         const page = createFakeChatGptPage({ finishResponse: false });
         const result = await runFakeQuery(page, { timeout: 1, allowCopyMarkdownFallback: true });
-        expect(result.status).toBe('polling');
+        expect(result).toMatchObject({ status: 'awaiting-response', terminal: false, progressVerified: false });
         expect(result.warnings).toContain('recovery-deferred-unverified');
     });
 

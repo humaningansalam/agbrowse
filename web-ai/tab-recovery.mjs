@@ -15,6 +15,7 @@ import { waitForConversationReady } from './navigation-ready.mjs';
 import { isWorkSession as _isWorkSession } from './chatgpt-work-picker.mjs';
 import { extractDurableConversationId, isDurableConversationUrl } from './conversation-url.mjs';
 import { WebAiError } from './errors.mjs';
+import { withActiveCommand } from './active-command-store.mjs';
 
 /** @typedef {import('./session-store.mjs').WebAiSession} WebAiSession */
 
@@ -826,10 +827,11 @@ export async function reattachSessionPage(deps, sessionId) {
  * @param {RecoverDeps} deps
  * @param {string} sessionId
  * @param {(ctx: ResolvedPage<T>) => Promise<T> | T} fn
+ * @param {{ ownership?: import('./active-command-store.mjs').ActiveCommandInput }} [options]
  * @returns {Promise<T>}
  */
-export async function withSessionPage(deps, sessionId, fn) {
-    return withSessionPageGuarded(deps, sessionId, fn, {});
+export async function withSessionPage(deps, sessionId, fn, options = {}) {
+    return withSessionPageGuarded(deps, sessionId, fn, options);
 }
 
 /**
@@ -843,11 +845,21 @@ export async function withSessionPage(deps, sessionId, fn) {
  * @param {RecoverDeps} deps
  * @param {string} sessionId
  * @param {(ctx: ResolvedPage<T>) => Promise<T> | T} fn
- * @param {{ stillActive?: () => boolean }} [options]
+ * @param {{ stillActive?: () => boolean, ownership?: import('./active-command-store.mjs').ActiveCommandInput }} [options]
  * @returns {Promise<T>}
  */
 export async function withSessionPageGuarded(deps, sessionId, fn, options = {}) {
     const stillActive = options.stillActive;
+    // Resolution can bind a newly committed URL or recover a gone target.
+    // Reserve the saved target BEFORE those writes, not only before polling.
+    // The caller also owns the resolved target for the operation itself.
+    if (options.ownership) {
+        const session = getSession(sessionId);
+        if (!session) throw new Error(`Session not found: ${sessionId}`);
+        return withActiveCommand({ ...options.ownership, sessionId,
+            provider: session?.vendor || 'chatgpt', targetId: session?.targetId,
+            port: deps.getPort() }, () => withSessionPageGuarded(deps, sessionId, fn, { stillActive }));
+    }
     const first = await resolveSessionPage(deps, sessionId, { allowNavigate: true, stillActive });
     if (/** @type {any} */ (first).strategy === 'unverified') throw livenessUnverifiedError(sessionId, deps, first);
     if (first.mismatch) throw sessionPageMismatchError(sessionId, first);

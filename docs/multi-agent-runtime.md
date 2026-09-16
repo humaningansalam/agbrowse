@@ -68,6 +68,54 @@ is required or added by this change.
 
 ## Regression coverage
 
+### Background response recovery and wait budgets (v6)
+
+For ChatGPT Chat with a committed user-message ID, poll reconciles the current
+conversation branch using the logged-in browser context's request client. It
+does not activate, reload, or borrow tabs. The final must follow that exact user
+message, contain no later user request in between, and be an assistant `final`
+message with successful terminal evidence. Private reasoning and tool messages
+are not returned as answers. Wrong branches, changed targets, and superseded
+generations cannot commit a recovered answer.
+
+The server text fallback deliberately does not collect files from a stale DOM.
+It reports `file-artifacts-not-probed-server-recovery`. Explicit image output and
+required-file policies continue through their existing capture contracts; text
+alone never satisfies them. Network requests are bounded, redirects are not
+followed with authorization, and authentication values are not logged or stored.
+
+A stored deadline is not evidence of provider failure. Exact Chat requests may
+be reconciled after expiry without changing their identity or resubmitting.
+Individual poll calls retain bounded execution. Query and watch continue beyond
+the generation wait when observed response/structural progress justifies it.
+An unchanged stop/in-progress indicator is not progress; evidence without
+change for five minutes becomes unverified, not a forced provider cancellation.
+
+`awaiting-response` with `errorCode: poll.wait-expired`, `terminal: false`, `waitExpired: true`, and
+`retryHint: poll-or-resume` ends a wait whose completion/progress is unverified.
+It must not be translated into “GPT has no answer.” A watcher before its stored
+deadline can keep observing; after expiry it exits with `watch.awaiting-response`
+unless progress is verified. `status --session` exposes `providerState` and
+`responseAvailable`; `sessions show` remains a read-only persisted snapshot.
+HTTP 429 and visible rate-limit dialogs stop polling as recoverable blocks.
+
+Target ownership is acquired before page binding/recovery and explicit poll/resume/watch
+deadline updates. Async-local lease context separates concurrent callers from
+truly nested operations. A rejected duplicate cannot shorten another command's
+deadline or change its session. CLI exits flush stdout and stderr before
+closing the CDP-owned event loop, including large JSON and error results.
+
+Callers keep their own send receipt (session ID, conversation, generation and
+role). Director and expert IDs are separate. Global lists, titles and the
+currently visible tab are never ownership evidence or substitutes for a lost ID.
+
+New coverage: `cli-output-drain.test.mjs`, `web-ai-server-response.test.mjs`,
+`web-ai-server-recovery-poll.test.mjs`, plus shared-target and watcher tests cover
+large slow pipes, stalled renderers, late completion, branch/identity rejection,
+generation races, unchanged progress, strict-file policy, and write-free rejection.
+
+### Existing browser and submission coverage
+
 `test/integration/web-ai-submission-and-body.test.mjs` runs real Chromium DOM
 operations against local fixtures: pre-submit attachment failure, preparing and
 uncertain submission rejection, state at the actual send click, lost acknowledgement

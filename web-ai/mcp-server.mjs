@@ -12,6 +12,7 @@ import { geminiSendWebAi, geminiPollWebAi } from './gemini-live.mjs';
 import { grokSendWebAi, grokPollWebAi } from './grok-live.mjs';
 import { runDoctor } from './doctor.mjs';
 import { assertSessionPollable, getSession, resolvePollTimeoutSec, expiredSessionTimeoutResult } from './session.mjs';
+import { canReconcileChatGptSession, chatGptReconcileTimeoutSec } from './chatgpt-server-response.mjs';
 import {
     captureCopiedResponseText,
     CHATGPT_COPY_SELECTORS,
@@ -337,14 +338,14 @@ async function runMcpSessionPoll(name, args, deps) {
     // this an expired session still opens a tab and takes at least one probe.
     const mcpFallbackVendor = args.provider || args.vendor || 'chatgpt';
     const expiredBeforeLock = expiredSessionTimeoutResult(sessionId, mcpFallbackVendor);
-    if (expiredBeforeLock) return expiredBeforeLock;
+    if (expiredBeforeLock && (expiredBeforeLock.status === 'complete' || !canReconcileChatGptSession(stored))) return expiredBeforeLock;
     return withSessionCommandLock(sessionId, () => {
         assertSessionPollable(getSession(sessionId));
         // Re-checked inside the lock: acquiring it retries 200 times at 25ms,
         // so a nearly-expired session can pass the check above and expire
         // before the page is ever resolved.
         const expiredInLock = expiredSessionTimeoutResult(sessionId, mcpFallbackVendor);
-        if (expiredInLock) return expiredInLock;
+        if (expiredInLock && (expiredInLock.status === 'complete' || !canReconcileChatGptSession(getSession(sessionId)))) return expiredInLock;
         return withSessionPageGuarded(deps, sessionId, async ({ page, targetId, session }) => {
             const provider = providerFromArgs({ provider: session.vendor || stored.vendor || args.provider || args.vendor || 'chatgpt' });
             const sessionDeps = {
@@ -369,14 +370,16 @@ async function runMcpSessionPoll(name, args, deps) {
                     // floored the remainder to a whole second and read as an
                     // explicit override; omitting it would hand Gemini and Grok
                     // their own multi-minute defaults instead.
-                    timeout: resolvePollTimeoutSec(
+                    generation: session.generation,
+                    timeout: canReconcileChatGptSession(session) ? chatGptReconcileTimeoutSec(args, session) : resolvePollTimeoutSec(
                         args,
                         session,
                         session.vendor || provider,
                     ),
                 });
             });
-        }, { stillActive: storedDeadlineStillActive(stored) });
+        }, { stillActive: canReconcileChatGptSession(stored) ? undefined : storedDeadlineStillActive(stored),
+            ownership: { command: `mcp ${name}`, owner: 'mcp' } });
     });
 }
 

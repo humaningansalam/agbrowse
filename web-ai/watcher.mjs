@@ -10,6 +10,8 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { pollWebAi } from './chatgpt.mjs';
+import { canReconcileChatGptSession } from './chatgpt-server-response.mjs';
+import { withActiveCommand } from './active-command-store.mjs';
 import { isWorkSession, pollWorkSession } from './chatgpt-work-picker.mjs';
 import { geminiPollWebAi } from './gemini-live.mjs';
 import { grokPollWebAi } from './grok-live.mjs';
@@ -91,11 +93,13 @@ export async function watchSession(deps, input = {}, notifier = null) {
     let final = null;
     try {
         if (options.hasExplicitDeadlineOverride && options.deadlineAt) {
-            const deadlineWrite = await updateSessionForGeneration(
+            const deadlineWrite = await withActiveCommand({ command: 'web-ai watch setup',
+                provider: startingSession.vendor || 'chatgpt', sessionId: options.sessionId,
+                targetId: startingSession.targetId, owner: 'cli', port: deps.getPort?.() || 9222 }, () => updateSessionForGeneration(
                 options.sessionId,
                 generation,
                 { deadlineAt: options.deadlineAt },
-            );
+            ));
             if (deadlineWrite === GENERATION_CHANGED) {
                 return {
                     ok: false,
@@ -156,6 +160,11 @@ export async function watchSession(deps, input = {}, notifier = null) {
                 });
                 break;
             }
+            if (tick.status === 'awaiting-response') {
+                await emit({ type: 'watch.awaiting-response', status: tick.status, terminal: false,
+                    vendor: tick.vendor, retryHint: 'poll-or-resume', providerState: tick.providerState || 'unknown' });
+                break;
+            }
             if (options.once) {
                 final = { ...tick, ok: true, status: 'watch-once', watchStatus: tick.status, terminal: false };
                 break;
@@ -172,7 +181,8 @@ export async function watchSession(deps, input = {}, notifier = null) {
             // caller as a failure.
             ok: final?.errorCode !== 'provider.file-artifact'
                 && final?.errorCode !== 'session.generation-superseded'
-                && final?.errorCode !== 'provider.interstitial',
+                && final?.errorCode !== 'provider.interstitial'
+                && final?.status !== 'awaiting-response',
             status: final?.status || 'watch-complete',
             sessionId: options.sessionId,
             generation,
@@ -221,20 +231,9 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         });
     }
 
-    if (session.status === 'timeout' && !isDeadlineExpired(session.deadlineAt)) {
-        const restored = await restorePollingBeforeDeadline(
-            session.sessionId,
-            generation,
-            session.deadlineAt,
-            {
-                status: 'polling',
-                warnings: appendUniqueWarning(session.warnings || [], 'watcher-resumed-transient-timeout'),
-            },
-        );
-        if (restored === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
-        if (restored !== DEADLINE_PASSED) session.status = restored?.status || session.status;
-    }
-    if (TERMINAL_SESSION_STATUSES.has(session.status)) {
+    const reconcilable = canReconcileChatGptSession(session);
+    const resumingTimeout = session.status === 'timeout' && (reconcilable || !isDeadlineExpired(session.deadlineAt));
+    if (TERMINAL_SESSION_STATUSES.has(session.status) && !resumingTimeout) {
         return {
             ok: true, sessionId: session.sessionId, vendor,
             status: session.status, terminal: true, generation,
@@ -242,7 +241,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             warnings: session.warnings || [],
         };
     }
-    if (isDeadlineExpired(session.deadlineAt)) {
+    if (isDeadlineExpired(session.deadlineAt) && !reconcilable) {
         const expired = await updateSessionForGeneration(session.sessionId, generation, {
             status: 'timeout',
             lastError: { errorCode: 'provider.poll-timeout', message: 'watcher deadline reached' },
@@ -265,9 +264,18 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
     try {
         // The recovery inside the resolver performs binding writes; under a
         // stored deadline those writes are refused post-lock once it passes.
-        const result = await withSessionPageGuarded(deps, options.sessionId, async ({ page, targetId, session: resolvedSession }) => {
+        const result = await withSessionPageGuarded(deps, options.sessionId, async ({ page, targetId, session: resolvedSession }) => withActiveCommand({
+            command: 'web-ai watch', provider: vendor, sessionId: options.sessionId,
+            targetId, owner: 'cli', port: deps.getPort?.() || 9222,
+        }, async () => {
         if (sessionGeneration(resolvedSession || session) !== generation) {
             return supersededWatchTick(session, vendor, generation);
+        }
+        if (resumingTimeout && !isDeadlineExpired(session.deadlineAt)) {
+            const restored = await restorePollingBeforeDeadline(session.sessionId, generation, session.deadlineAt, {
+                status: 'polling', warnings: appendUniqueWarning(session.warnings || [], 'watcher-resumed-transient-timeout'),
+            });
+            if (restored === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
         }
         const profileLockSummary = await readProfileLockSummary()
             .catch(err => ({ state: 'unknown', error: err?.message || String(err) }));
@@ -281,7 +289,9 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             };
         }
 
-        const preflight = await runWatcherPreflight(page, vendor);
+        // Existing Chat responses do not require a responsive composer. A
+        // background DOM must not block the independent server reconciliation.
+        const preflight = reconcilable ? { worst: 'ok', rows: [] } : await runWatcherPreflight(page, vendor);
         if (preflight.worst === 'fail') {
             const failed = await updateSessionForGeneration(session.sessionId, generation, {
                 status: 'polling',
@@ -316,7 +326,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             },
         };
 
-        const domHashBefore = await domHashAround(/** @type {any} */ (page), ['body'], { maxChars: options.domHashMaxChars }).catch(() => null);
+        const domHashBefore = reconcilable ? null : await domHashAround(/** @type {any} */ (page), ['body'], { maxChars: options.domHashMaxChars }).catch(() => null);
         const pollResult = await pollVendor(sessionDeps, vendor, resolvedSession || session, {
             ...options,
             generation,
@@ -328,7 +338,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             consumedDisconnect = { error: pollResult.error, pollResult };
             return pollResult;
         }
-        const domHashAfter = await domHashAround(/** @type {any} */ (page), ['body'], { maxChars: options.domHashMaxChars }).catch(() => null);
+        const domHashAfter = reconcilable ? null : await domHashAround(/** @type {any} */ (page), ['body'], { maxChars: options.domHashMaxChars }).catch(() => null);
         const answerText = typeof (/** @type {any} */ (pollResult)).answerText === 'string'
             ? (/** @type {any} */ (pollResult)).answerText
             : (typeof (/** @type {any} */ (pollResult)).answer === 'string' ? (/** @type {any} */ (pollResult)).answer : null);
@@ -338,6 +348,9 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
         }
         let status = pollResult?.errorCode === 'provider.interstitial'
             ? 'blocked'
+            : pollResult.status === 'awaiting-response'
+                ? (isDeadlineExpired(refreshed.deadlineAt) ? 'awaiting-response' : 'polling')
+            : pollResult.progressVerified === true ? 'polling'
             : refreshed.status || pollResult.status || 'polling';
         /** @type {string[]} */
         const watcherWarnings = [];
@@ -358,6 +371,7 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             lastDomHash: domHashAfter || domHashBefore || refreshed.lastDomHash || null,
             lastStreamingState: deriveStreamingState(status, pollResult),
             lastResponseCharCount: answerText ? answerText.length : (refreshed.lastResponseCharCount || 0),
+            ...(pollResult.providerObservation ? { responseObservation: pollResult.providerObservation } : {}),
         });
         if (observed === GENERATION_CHANGED) return supersededWatchTick(session, vendor, generation);
 
@@ -380,10 +394,13 @@ export async function watchSessionOnce(deps, input = {}, recoveryDeps = {}) {
             ...(pollResult.retryHint ? { retryHint: pollResult.retryHint } : {}),
             ...(pollResult.evidence ? { evidence: pollResult.evidence } : {}),
             ...(pollResult.artifacts ? { artifacts: pollResult.artifacts } : {}),
+            ...(pollResult.providerState ? { providerState: pollResult.providerState, progressVerified: pollResult.progressVerified === true,
+                waitExpired: pollResult.waitExpired === true, recoverable: pollResult.recoverable === true } : {}),
             preflight,
             profileLock: profileLockSummary,
         };
-        }, { stillActive: storedDeadlineStillActive(session) });
+        }), { stillActive: reconcilable ? undefined : storedDeadlineStillActive(session),
+            ownership: { command: 'web-ai watch', owner: 'cli' } });
         if (!consumedDisconnect) return result;
     } catch (err) {
         if (!isCdpDisconnectError(err)) throw err;
@@ -755,11 +772,12 @@ async function callVendorPoll(deps, vendor, session, options) {
             // provider treats an explicit timeout as the caller's authority.
             // A whole-second floor here was the same bug one order smaller: it
             // rounded 400ms back up to a full second.
-            timeout: String(resolvePollTimeoutSec(
+            timeout: String(canReconcileChatGptSession(session) ? options.pollTimeoutSec : resolvePollTimeoutSec(
                 { timeout: options.pollTimeoutSec },
                 session,
                 vendor,
             )),
+            continuationObservation: session.responseObservation || null,
             allowCopyMarkdownFallback: options.allowCopyMarkdownFallback === true,
             navigate: options.navigate === true,
         });

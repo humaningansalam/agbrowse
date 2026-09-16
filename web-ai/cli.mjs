@@ -6,6 +6,7 @@
  */
 import { parseArgs } from 'node:util';
 import { renderWebAi, statusWebAi, sendWebAi, pollWebAi, queryWebAi, stopWebAi, deepResearchWebAi } from './chatgpt.mjs';
+import { canReconcileChatGptSession, chatGptReconcileTimeoutSec } from './chatgpt-server-response.mjs';
 import { codeWebAi, extractCodeArtifacts } from './code-mode.mjs';
 import { buildCodeModePrompt } from './code-mode-prompt.mjs';
 import { geminiStatusWebAi, geminiSendWebAi, geminiPollWebAi, geminiQueryWebAi, geminiStopWebAi } from './gemini-live.mjs';
@@ -1296,16 +1297,10 @@ async function runBoundCommand(command, deps, input, pollFn, stopFn) {
         // the active-command row below, whose owner PID is reclaimable on death.
         const startingSession = getSession(input.session);
         assertSessionPollable(startingSession);
-        await applyExplicitSessionDeadlineOverride(
-            input.session,
-            input,
-            startingSession ? sessionGeneration(startingSession) : undefined,
-        );
         const expiredBeforeResolve = expiredSessionTimeoutResult(input.session, input.vendor || 'chatgpt');
-        if (expiredBeforeResolve) return expiredBeforeResolve;
+        if (expiredBeforeResolve && (expiredBeforeResolve.status === 'complete'
+            || (!input.timeout && !input.deadline && !canReconcileChatGptSession(startingSession)))) return expiredBeforeResolve;
         return withSessionPage(deps, input.session, async ({ page, targetId, session }) => {
-            const expiredAfterResolve = expiredSessionTimeoutResult(input.session, session.vendor || 'chatgpt');
-            if (expiredAfterResolve) return expiredAfterResolve;
             const effectivePollFn = isWorkSession(session) ? pollWorkSession : pollFn;
             const sessionDeps = {
                 ...deps,
@@ -1314,8 +1309,12 @@ async function runBoundCommand(command, deps, input, pollFn, stopFn) {
                 getCdpSession: async () => (/** @type {any} */ (page)).context().newCDPSession(page),
             };
             return withWebAiActiveCommand(command, sessionDeps, { ...input, vendor: session.vendor, session: session.sessionId }, async () => {
+                // Only the caller that acquired this target may change a
+                // shared deadline. A rejected observer must be write-free.
+                session = await applyExplicitSessionDeadlineOverride(input.session, input, sessionGeneration(session)) || session;
                 const expiredBeforePoll = expiredSessionTimeoutResult(input.session, session.vendor || 'chatgpt');
-                if (expiredBeforePoll) return expiredBeforePoll;
+                if (expiredBeforePoll && (expiredBeforePoll.status === 'complete'
+                    || !canReconcileChatGptSession(session))) return expiredBeforePoll;
                 const result = await effectivePollFn(sessionDeps, {
                     ...input,
                     vendor: session.vendor,
@@ -1327,14 +1326,16 @@ async function runBoundCommand(command, deps, input, pollFn, stopFn) {
                     // and an explicit one was never clamped to the stored
                     // deadline. ChatGPT reads `deadlineAt` itself, but the
                     // other providers do not.
-                    timeout: resolvePollTimeoutSec(input, session, session.vendor || 'chatgpt'),
+                    timeout: canReconcileChatGptSession(session)
+                        ? chatGptReconcileTimeoutSec(input, session)
+                        : resolvePollTimeoutSec(input, session, session.vendor || 'chatgpt'),
                 });
                 if (isRecoverableTabCrash(result)) {
                     throw new Error(result.error || 'target closed during session-bound web-ai command');
                 }
                 return result;
             });
-        });
+        }, { ownership: { command: 'web-ai poll', owner: 'cli' } });
     }
     throw new Error(`runBoundCommand: unsupported command ${command}`);
 }

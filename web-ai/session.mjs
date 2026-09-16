@@ -462,6 +462,7 @@ export function beginSessionGeneration(sessionId, envelope, meta = {}) {
             lastAxHash: null,
             lastStreamingState: 'unknown',
             lastResponseCharCount: 0,
+            responseObservation: null,
         });
     });
 }

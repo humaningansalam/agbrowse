@@ -2,7 +2,9 @@
 import { existsSync, mkdirSync, openSync, closeSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { generateSessionId } from './session-store.mjs';
+import { WebAiError } from './errors.mjs';
 
 /**
  * @typedef {Error & { code?: string, cause?: unknown, command?: ActiveCommandRow }} ActiveCommandError
@@ -36,8 +38,8 @@ const LOCK_RETRY_MS = 25;
 const LOCK_RETRY_LIMIT = 200;
 const STALE_LOCK_MS = 30_000;
 const DEFAULT_TTL_MS = 2 * 60_000;
-/** @type {ActiveCommandRow|null} */
-let currentCommandContext = null;
+/** @type {AsyncLocalStorage<ActiveCommandRow>} */
+const commandContext = new AsyncLocalStorage();
 
 function home() {
     return process.env.BROWSER_AGENT_HOME || join(homedir(), '.browser-agent');
@@ -160,7 +162,13 @@ export async function registerActiveCommand(input = {}) {
                 row.commandId !== command.commandId)
             : null;
         if (targetConflict) {
-            const error = /** @type {ActiveCommandError} */ (new Error(`target already owned by active command: ${targetConflict.commandId}`));
+            const error = /** @type {ActiveCommandError} */ (new WebAiError({
+                errorCode: 'active-command.target-owned', stage: 'session-ownership',
+                retryHint: 'reuse-existing-command', mutationAllowed: false,
+                message: `target already owned by active command: ${targetConflict.commandId}`,
+                evidence: { sessionId: targetConflict.sessionId, targetId: targetConflict.targetId,
+                    commandId: targetConflict.commandId },
+            }));
             error.code = 'active-command.target-owned';
             error.command = targetConflict;
             throw error;
@@ -247,12 +255,11 @@ export async function activeCommandTargetIds(filter = {}) {
  * @returns {Promise<T>}
  */
 export async function withActiveCommand(input, fn) {
+    const currentCommandContext = commandContext.getStore();
     if (isSameCommandTarget(currentCommandContext, input)) {
         return fn(/** @type {ActiveCommandRow} */ (currentCommandContext));
     }
     const command = await registerActiveCommand(input);
-    const previousContext = currentCommandContext;
-    currentCommandContext = command;
     /** @type {NodeJS.Timeout|null} */
     let heartbeatTimer = null;
     if (input.heartbeatIntervalMs !== 0) {
@@ -263,16 +270,15 @@ export async function withActiveCommand(input, fn) {
         heartbeatTimer.unref?.();
     }
     try {
-        return await fn(command);
+        return await commandContext.run(command, () => fn(command));
     } finally {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
-        currentCommandContext = previousContext;
         await releaseActiveCommand(command.commandId).catch(() => undefined);
     }
 }
 
 /**
- * @param {ActiveCommandRow|null} command
+ * @param {ActiveCommandRow|null|undefined} command
  * @param {ActiveCommandInput} [input]
  */
 function isSameCommandTarget(command, input = {}) {

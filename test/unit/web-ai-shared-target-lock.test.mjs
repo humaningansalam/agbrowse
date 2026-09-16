@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -25,6 +25,52 @@ afterEach(() => {
 });
 
 describe('web-ai shared target lock guard', () => {
+    it.each(['poll', 'resume', 'watch'].flatMap(mode => [true, false].map(bound => [mode, bound])))
+    ('a rejected %s leaves the owner session byte-for-byte unchanged (conversation bound=%s)', async (mode, bound) => {
+        const page = { url: () => 'https://chatgpt.com/c/owned-conversation' };
+        vi.doMock('../../skills/browser/tab-manager.mjs', () => ({
+            getPageByTargetId: vi.fn(async () => page), probeTabAlive: vi.fn(async () => 'alive'),
+            isTabAlive: vi.fn(async () => true), createTab: vi.fn(), closeTab: vi.fn(),
+            waitForPageByTargetId: vi.fn(), listManagedTabs: vi.fn(async () => []),
+        }));
+        const { createSession, getSession, updateSession } = await import('../../web-ai/session.mjs');
+        const { registerActiveCommand } = await import('../../web-ai/active-command-store.mjs');
+        const { runWebAiCli } = await import('../../web-ai/cli.mjs');
+        const session = createSession({ vendor: 'chatgpt', prompt: 'owned' }, {
+            targetId: 'owned-target', conversationUrl: bound ? page.url() : 'https://chatgpt.com/', deadlineAt: new Date(Date.now() + 5400_000).toISOString(),
+        });
+        updateSession(session.sessionId, { submittedUserMessageId: 'owned-user' });
+        await registerActiveCommand({ command: 'web-ai query', provider: 'chatgpt', targetId: 'owned-target',
+            sessionId: session.sessionId, owner: 'cli', port: 9222 });
+        const before = JSON.stringify(getSession(session.sessionId));
+        const beforeBytes = readFileSync(join(tmpHome, 'web-ai-sessions.json'));
+        vi.spyOn(console, 'log').mockImplementation(() => {});
+        vi.spyOn(console, 'error').mockImplementation(() => {});
+        const args = mode === 'resume' ? ['sessions', 'resume', session.sessionId] : [mode, '--session', session.sessionId];
+        await expect(runWebAiCli([...args, '--timeout', '60', '--json'], {
+            getPort: () => 9222, getBrowserStatus: async () => ({ running: true }), readBrowserState: () => ({ headless: false }),
+            getPage: vi.fn(async () => { throw new Error('active page must not be used'); }),
+        })).rejects.toMatchObject({ errorCode: 'active-command.target-owned', retryHint: 'reuse-existing-command' });
+        expect(JSON.stringify(getSession(session.sessionId))).toBe(before);
+        expect(readFileSync(join(tmpHome, 'web-ai-sessions.json'))).toEqual(beforeBytes);
+    });
+
+    it('does not treat a concurrent command in the same process as a nested owner', async () => {
+        const { withActiveCommand } = await import('../../web-ai/active-command-store.mjs');
+        const input = { command: 'web-ai poll', provider: 'chatgpt', targetId: 'parallel-target', port: 9222 };
+        let release, entered;
+        const started = new Promise(resolve => { entered = resolve; });
+        const owner = withActiveCommand(input, async () => {
+            entered();
+            await new Promise(resolve => { release = resolve; });
+        });
+        await started;
+        try {
+            await expect(withActiveCommand(input, async () => 'must not run'))
+                .rejects.toMatchObject({ errorCode: 'active-command.target-owned' });
+        } finally { release(); await owner; }
+    });
+
     it('creates a distinct target for every new send without consulting the active tab', async () => {
         const makePage = () => {
             let url = 'about:blank';

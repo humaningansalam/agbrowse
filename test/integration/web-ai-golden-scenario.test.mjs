@@ -133,7 +133,7 @@ describe.sequential('web-ai golden scenario (ask -> poll -> audit -> artifact)',
         });
         // No-recovery timeout branch contract (chatgpt.mjs:645-683).
         expect(result.ok).toBe(false);
-        expect(result.status).toBe('timeout');
+        expect(result).toMatchObject({ status: 'awaiting-response', terminal: false, waitExpired: true });
         expect(result.recoverable).toBe(true);
         expect(result.retryHint).toBe('poll-or-resume');
         // Silent success is forbidden: no complete status, no exactness-1 artifact.

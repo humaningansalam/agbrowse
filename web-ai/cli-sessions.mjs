@@ -13,6 +13,8 @@ import { WebAiError } from './errors.mjs';
 import { assertSessionPollable, applyExplicitSessionDeadlineOverride, getSession, listSessions, pruneSessionsOlderThan, resolvePollTimeoutSec, resolveTimeoutBudgetSec, expiredSessionTimeoutResult, sessionGeneration } from './session.mjs';
 import { resolveSessionPage, storedDeadlineStillActive, withSessionPage, withSessionPageGuarded } from './tab-recovery.mjs';
 import { withSessionCommandLock } from './session-store.mjs';
+import { withActiveCommand } from './active-command-store.mjs';
+import { canReconcileChatGptSession, chatGptReconcileTimeoutSec } from './chatgpt-server-response.mjs';
 import { buildSessionDoctorReport } from './session-doctor.mjs';
 
 const SESSIONS_SUBCOMMANDS = new Set(['list', 'show', 'resume', 'reattach', 'doctor', 'prune']);
@@ -96,17 +98,18 @@ export async function runSessionsCommand(args, values, deps, input) {
         let session = getSession(id);
         if (!session) throw new WebAiError({ errorCode: 'input.session-not-found', stage: 'input-preflight', retryHint: 'list-sessions', message: `no session record for ${id} — run \`agbrowse web-ai sessions list\``, evidence: { sessionId: id } });
         assertSessionPollable(session);
-        session = await applyExplicitSessionDeadlineOverride(id, input, sessionGeneration(session)) || session;
         // Refuse an expired session before resolving its page. The poll clamp
         // keeps a positive minimum so providers cannot read it as "no budget",
         // which means an expired session would otherwise still open a tab and
         // take at least one probe. Checked again inside the lock below.
         const expiredBeforeLock = expiredSessionTimeoutResult(id, session.vendor || 'chatgpt');
-        if (expiredBeforeLock) return expiredBeforeLock;
+        if (expiredBeforeLock && (expiredBeforeLock.status === 'complete'
+            || (!input.timeout && !input.deadline && !canReconcileChatGptSession(session)))) return expiredBeforeLock;
         // 35.2: a Deep Research session resumes via the DR capture path (no new
         // prompt), not the generic poller.
         if (session.researchMode === 'deep' && session.vendor === 'chatgpt') {
-            const drResult = await withSessionCommandLock(id, () => {
+            const drResult = await withSessionCommandLock(id, async () => {
+                session = await applyExplicitSessionDeadlineOverride(id, input, sessionGeneration(session)) || session;
                 // Re-checked INSIDE the lock. Acquiring it retries 200 times at
                 // 25ms, so a session with 150ms left can expire while waiting,
                 // and the pre-lock check alone let that run open a tab.
@@ -141,7 +144,8 @@ export async function runSessionsCommand(args, values, deps, input) {
         const result = await withSessionCommandLock(id, () => {
             // Re-checked inside the lock: see the Deep Research branch above.
             const expiredInLock = expiredSessionTimeoutResult(id, session.vendor || 'chatgpt');
-            if (expiredInLock) return expiredInLock;
+            if (expiredInLock && (expiredInLock.status === 'complete'
+                || (!input.timeout && !input.deadline && !canReconcileChatGptSession(session)))) return expiredInLock;
             return withSessionPageGuarded(deps, id, async ({ page, targetId, session: refreshed }) => {
             const sessionDeps = {
                 ...deps,
@@ -149,6 +153,11 @@ export async function runSessionsCommand(args, values, deps, input) {
                 getTargetId: async () => targetId,
                 getCdpSession: async () => /** @type {any} */ (page).context?.().newCDPSession?.(page),
             };
+            return withActiveCommand({ command: 'web-ai sessions resume', provider: refreshed.vendor,
+                sessionId: id, targetId, owner: 'cli', port: deps.getPort?.() || 9222 }, async () => {
+            refreshed = await applyExplicitSessionDeadlineOverride(id, input, sessionGeneration(refreshed)) || refreshed;
+            const expired = expiredSessionTimeoutResult(id, refreshed.vendor || 'chatgpt');
+            if (expired && (expired.status === 'complete' || !canReconcileChatGptSession(refreshed))) return expired;
             return pollFn(sessionDeps, {
                 ...pollInput,
                 vendor: refreshed.vendor,
@@ -158,9 +167,15 @@ export async function runSessionsCommand(args, values, deps, input) {
                 // down as if the user had typed it. Omitting it instead is only
                 // safe for ChatGPT: Gemini and Grok read no stored deadline and
                 // fall back to their own 1200s/600s defaults.
-                timeout: resolvePollTimeoutSec(input, refreshed, refreshed.vendor || 'chatgpt'),
+                generation: sessionGeneration(refreshed),
+                timeout: canReconcileChatGptSession(refreshed)
+                    ? chatGptReconcileTimeoutSec(input, refreshed)
+                    : resolvePollTimeoutSec(input, refreshed, refreshed.vendor || 'chatgpt'),
             });
-            }, { stillActive: storedDeadlineStillActive(session) });
+            });
+            }, { stillActive: canReconcileChatGptSession(session) || input.timeout || input.deadline
+                ? undefined : storedDeadlineStillActive(session),
+                ownership: { command: 'web-ai sessions resume', owner: 'cli' } });
         });
         return { ...result, status: result.status || 'resumed' };
     }

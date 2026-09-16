@@ -63,6 +63,7 @@
  */
 
 import { parseArgs } from 'node:util';
+import { exitAfterFlush } from './cli-exit.mjs';
 import { spawn, spawnSync } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -2390,7 +2391,7 @@ try {
                 } else {
                     console.error(result.stderr);
                 }
-                process.exit(result.exitCode || 1);
+                await exitAfterFlush(result.exitCode || 1);
             }
             console.log(result.stdout);
             break;
@@ -2401,7 +2402,7 @@ try {
             // ok:false and exit 0, so a failed lookup slipped through `&&`
             // chains as success.
             const searchResult = await runSearchCli(process.argv.slice(3));
-            if (searchResult && searchResult.ok === false) process.exit(1);
+            if (searchResult && searchResult.ok === false) await exitAfterFlush(1);
             break;
         }
         case 'extract':
@@ -2456,7 +2457,7 @@ try {
             // "FAIL" and exit 0 — useless in a `set -e` or `&&` CI chain, which
             // is exactly how --help tells you to verify claims.
             const webAiResult = await runWebAiCli(process.argv.slice(3), browserDeps);
-            if (webAiResult && webAiResult.ok === false) process.exit(1);
+            if (webAiResult && webAiResult.ok === false) await exitAfterFlush(1);
             break;
         }
         case 'runway':
@@ -2464,7 +2465,7 @@ try {
             break;
         case 'fetch': {
             const fetchResult = await runAdaptiveFetchCli(process.argv.slice(3), browserDeps);
-            if (fetchResult && fetchResult.ok === false) process.exit(1);
+            if (fetchResult && fetchResult.ok === false) await exitAfterFlush(1);
             break;
         }
         case 'start': {
@@ -2496,7 +2497,7 @@ try {
                 } else {
                     console.error('agbrowse start: ' + msg);
                 }
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             if (values['heavy-site-compat']) process.env.AGBROWSE_HEAVY_SITE_COMPAT = '1';
             if (values['keep-bg-networking']) process.env.AGBROWSE_KEEP_BG_NETWORKING = '1';
@@ -2524,7 +2525,7 @@ try {
             const targetUrl = connectVals['browser-url'] || connectVals['ws-endpoint'];
             if (!targetUrl && !connectVals.auto) {
                 console.error('Usage: agbrowse connect --browser-url <url> | --ws-endpoint <url> | --auto');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             const connectPort = targetUrl
                 ? Number(new URL(targetUrl).port || DEFAULT_CDP_PORT)
@@ -2533,12 +2534,12 @@ try {
             const listening = await isPortListening(connectPort);
             if (!listening) {
                 console.error('❌ No Chrome listening on port ' + connectPort);
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             const cdpReady = await waitForCdpReady(connectPort, 5000);
             if (!cdpReady) {
                 console.error('❌ Port ' + connectPort + ' is listening but not responding as CDP');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             recordExternalConnect({ endpoint, port: connectPort });
             console.log('🌐 Connected to external Chrome at ' + endpoint);
@@ -2600,7 +2601,7 @@ try {
             } else {
                 console.log(formatDoctorReport(r));
             }
-            if (!r.ok) process.exit(2);
+            if (!r.ok) await exitAfterFlush(2);
             break;
         }
         case 'snapshot': {
@@ -2758,7 +2759,7 @@ try {
         }
         case 'click': {
             const ref = process.argv[3];
-            if (!ref) { console.error('Usage: browser.mjs click <ref>'); process.exit(1); }
+            if (!ref) { console.error('Usage: browser.mjs click <ref>'); await exitAfterFlush(1); }
             const opts = {};
             if (process.argv.includes('--double')) opts.doubleClick = true;
             if (process.argv.includes('--right')) opts.rightClick = true;
@@ -2792,7 +2793,7 @@ try {
             const my = parseInt(process.argv[4]);
             if (isNaN(mx) || isNaN(my)) {
                 console.error('Usage: browser.mjs mouse-click <x> <y> [--double]');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             const mOpts = {};
             if (process.argv.includes('--double')) mOpts.doubleClick = true;
@@ -2805,7 +2806,7 @@ try {
             const my = parseInt(process.argv[4]);
             if (isNaN(mx) || isNaN(my)) {
                 console.error('Usage: browser.mjs move-mouse <x> <y>');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             await moveMouse(getPort(), mx, my);
             console.log(`mouse moved to (${mx}, ${my})`);
@@ -2825,7 +2826,7 @@ try {
         }
         case 'navigate': {
             const url = process.argv[3];
-            if (!url) { console.error('Usage: browser.mjs navigate <url> [--wait-until commit|load|domcontentloaded|networkidle] [--timeout ms]'); process.exit(1); }
+            if (!url) { console.error('Usage: browser.mjs navigate <url> [--wait-until commit|load|domcontentloaded|networkidle] [--timeout ms]'); await exitAfterFlush(1); }
             const wuIdx = process.argv.indexOf('--wait-until');
             const tIdx = process.argv.indexOf('--timeout');
             const opts = {};
@@ -2851,7 +2852,7 @@ try {
             }
             if (isNaN(width) || isNaN(height)) {
                 console.error('Usage: browser.mjs resize <width> <height> [--fullscreen]');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             const r = await resize(getPort(), width, height);
             if (r.warning) console.warn(`[browser] resize fallback: ${r.warning}`);
@@ -2928,7 +2929,7 @@ try {
             const json = process.argv.includes('--json');
             const force = process.argv.includes('--force');
             const target = process.argv[3];
-            if (!target) { console.error('Usage: browser.mjs tab-switch <index-or-targetId> [--json] [--force]'); process.exit(1); }
+            if (!target) { console.error('Usage: browser.mjs tab-switch <index-or-targetId> [--json] [--force]'); await exitAfterFlush(1); }
             const ts = await tabSwitch(getPort(), target, { force });
             if (json) console.log(JSON.stringify(ts, null, 2));
             else console.log(`switched to ${ts.tab ? `tab ${ts.tab}` : ts.targetId}: ${ts.title}`);
@@ -2938,7 +2939,7 @@ try {
             const json = process.argv.includes('--json');
             const force = process.argv.includes('--force');
             const target = process.argv[3];
-            if (!target) { console.error('Usage: browser.mjs select-tab <index-or-targetId> [--json] [--force]'); process.exit(1); }
+            if (!target) { console.error('Usage: browser.mjs select-tab <index-or-targetId> [--json] [--force]'); await exitAfterFlush(1); }
             const ts = await tabSwitch(getPort(), target, { force });
             if (json) console.log(JSON.stringify({ ...ts, alias: 'select-tab' }, null, 2));
             else console.log(`switched to ${ts.tab ? `tab ${ts.tab}` : ts.targetId}: ${ts.title}`);
@@ -2990,7 +2991,7 @@ try {
             });
             const json = values.json;
             const target = positionals[0];
-            if (!target) { console.error('Usage: browser.mjs tab-close <targetId> [--json]'); process.exit(1); }
+            if (!target) { console.error('Usage: browser.mjs tab-close <targetId> [--json]'); await exitAfterFlush(1); }
             const result = await closeTab(getPort(), target);
             const state = readPersistedState();
             if (state?.activeTargetId === target) {
@@ -3018,7 +3019,7 @@ try {
             });
             if (values['include-untracked'] === true && values.force !== true) {
                 console.error('error: tab-cleanup --include-untracked requires --force');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             const cleanupOpts = {
                 idleTimeoutMs: values['idle-after'] ? parseDuration(values['idle-after']) : undefined,
@@ -3181,7 +3182,7 @@ try {
             const scrollAmount = process.argv.includes('--amount') ? parseInt(process.argv[process.argv.indexOf('--amount') + 1]) : undefined;
             if (!dir || !['up', 'down', 'left', 'right'].includes(dir)) {
                 console.error('Usage: browser.mjs scroll <up|down|left|right> [--amount N] [--ref eN] [--json]');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             if (scrollRef) {
                 const sr = await scroll(getPort(), dir, { amount: scrollAmount, ref: scrollRef });
@@ -3197,7 +3198,7 @@ try {
         case 'wait-for': {
             const json = process.argv.includes('--json');
             const wRef = process.argv[3];
-            if (!wRef) { console.error('Usage: browser.mjs wait-for <ref> [--timeout ms] [--json]'); process.exit(1); }
+            if (!wRef) { console.error('Usage: browser.mjs wait-for <ref> [--timeout ms] [--json]'); await exitAfterFlush(1); }
             const wTimeout = process.argv.includes('--timeout') ? parseInt(process.argv[process.argv.indexOf('--timeout') + 1]) : undefined;
             const wr = await waitFor(getPort(), wRef, { timeout: wTimeout });
             console.warn('[browser] wait-for <ref> is deprecated. Prefer wait-for-selector or wait-for-text.');
@@ -3208,7 +3209,7 @@ try {
         case 'wait-for-selector': {
             const json = process.argv.includes('--json');
             const selector = process.argv[3];
-            if (!selector) { console.error('Usage: browser.mjs wait-for-selector <selector> [--timeout ms] [--json]'); process.exit(1); }
+            if (!selector) { console.error('Usage: browser.mjs wait-for-selector <selector> [--timeout ms] [--json]'); await exitAfterFlush(1); }
             const timeout = process.argv.includes('--timeout') ? parseInt(process.argv[process.argv.indexOf('--timeout') + 1]) : undefined;
             const wr = await waitForSelector(getPort(), selector, { timeout });
             if (json) console.log(JSON.stringify(wr, null, 2));
@@ -3222,7 +3223,7 @@ try {
             // flag's value joined the search text: `--port 9333` made this wait
             // for "QA Fixture 9333" and time out.
             const text = collectPositionalArgs(process.argv.slice(3)).join(' ');
-            if (!text) { console.error('Usage: browser.mjs wait-for-text <text> [--timeout ms] [--json]'); process.exit(1); }
+            if (!text) { console.error('Usage: browser.mjs wait-for-text <text> [--timeout ms] [--json]'); await exitAfterFlush(1); }
             const timeout = timeoutIndex !== -1 ? parseInt(process.argv[timeoutIndex + 1]) : undefined;
             const wr = await waitForText(getPort(), text, { timeout });
             if (json) console.log(JSON.stringify(wr, null, 2));
@@ -3232,7 +3233,7 @@ try {
         case 'wait': {
             const json = process.argv.includes('--json');
             const wMs = parseInt(process.argv[3]);
-            if (isNaN(wMs)) { console.error('Usage: browser.mjs wait <milliseconds> [--json]'); process.exit(1); }
+            if (isNaN(wMs)) { console.error('Usage: browser.mjs wait <milliseconds> [--json]'); await exitAfterFlush(1); }
             await waitMs(wMs);
             const result = { ok: true, waitedMs: wMs };
             if (json) console.log(JSON.stringify(result, null, 2));
@@ -3243,7 +3244,7 @@ try {
             const json = process.argv.includes('--json');
             const sRef = process.argv[3];
             const sVal = process.argv[4];
-            if (!sRef || !sVal) { console.error('Usage: browser.mjs select <ref> <value> [--json]'); process.exit(1); }
+            if (!sRef || !sVal) { console.error('Usage: browser.mjs select <ref> <value> [--json]'); await exitAfterFlush(1); }
             const result = await selectOption(getPort(), sRef, sVal);
             if (json) console.log(JSON.stringify(result, null, 2));
             else console.log(`selected "${sVal}" in ${sRef}`);
@@ -3252,7 +3253,7 @@ try {
         case 'check': {
             const json = process.argv.includes('--json');
             const ref = process.argv[3];
-            if (!ref) { console.error('Usage: browser.mjs check <ref> [--json]'); process.exit(1); }
+            if (!ref) { console.error('Usage: browser.mjs check <ref> [--json]'); await exitAfterFlush(1); }
             const result = await setChecked(getPort(), ref, true);
             if (json) console.log(JSON.stringify(result, null, 2));
             else console.log(`checked ${ref}`);
@@ -3261,7 +3262,7 @@ try {
         case 'uncheck': {
             const json = process.argv.includes('--json');
             const ref = process.argv[3];
-            if (!ref) { console.error('Usage: browser.mjs uncheck <ref> [--json]'); process.exit(1); }
+            if (!ref) { console.error('Usage: browser.mjs uncheck <ref> [--json]'); await exitAfterFlush(1); }
             const result = await setChecked(getPort(), ref, false);
             if (json) console.log(JSON.stringify(result, null, 2));
             else console.log(`unchecked ${ref}`);
@@ -3270,7 +3271,7 @@ try {
         case 'drag': {
             const dFrom = process.argv[3];
             const dTo = process.argv[4];
-            if (!dFrom || !dTo) { console.error('Usage: browser.mjs drag <fromRef> <toRef>'); process.exit(1); }
+            if (!dFrom || !dTo) { console.error('Usage: browser.mjs drag <fromRef> <toRef>'); await exitAfterFlush(1); }
             await drag(getPort(), dFrom, dTo);
             console.log(`dragged ${dFrom} → ${dTo}`);
             break;
@@ -3282,7 +3283,7 @@ try {
             // `9333` in cwd, `--port 9333` uploaded it alongside the requested
             // one and reported success.
             const uFiles = collectPositionalArgs(process.argv.slice(4));
-            if (!uRef || uFiles.length === 0) { console.error('Usage: browser.mjs upload <ref> <file>... [--json]'); process.exit(1); }
+            if (!uRef || uFiles.length === 0) { console.error('Usage: browser.mjs upload <ref> <file>... [--json]'); await exitAfterFlush(1); }
             const result = await uploadFiles(getPort(), uRef, uFiles);
             if (json) console.log(JSON.stringify(result, null, 2));
             else console.log(`uploaded ${uFiles.length} file(s) to ${uRef}`);
@@ -3321,7 +3322,7 @@ try {
                 else console.log('action-memory: cleared');
             } else {
                 console.error('Usage: browser.mjs action-memory [list|clear] [--origin <url>] [--json]');
-                process.exit(1);
+                await exitAfterFlush(1);
             }
             break;
         }
@@ -3755,7 +3756,7 @@ try {
 `);
     }
     // Force exit — playwright CDP WebSocket keeps event loop alive
-    process.exit(0);
+    await exitAfterFlush(0);
 } catch (e) {
     // `--json` (or AGBROWSE_JSON_ERRORS=1) is this CLI's machine-readable
     // contract, and the help text promises it globally under `Environment:`.
@@ -3797,5 +3798,5 @@ try {
             }
         }
     }
-    process.exit(1);
+    await exitAfterFlush(1);
 }

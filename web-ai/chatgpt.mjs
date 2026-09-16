@@ -5,6 +5,7 @@
  * @typedef {any} Page
  */
 import { renderQuestionEnvelope, renderQuestionEnvelopeWithContext, normalizeEnvelope } from './question.mjs';
+import { createHash } from 'node:crypto';
 import { defineCapability, probeFirstVisibleSelector, probeHostMatches, runCapabilities, worstCapabilityState } from './capability.mjs';
 import { INPUT_SELECTORS as CHATGPT_COMPOSER_SELECTORS } from './chatgpt-composer.mjs';
 import {
@@ -42,6 +43,7 @@ import { detectInterstitial, INTERSTITIAL_SHELL_SELECTORS_BY_PROVIDER } from './
 import { finalizeProviderTab } from './tab-finalizer.mjs';
 import { saveAssistantDownloadableFiles } from './chatgpt-files.mjs';
 import { observeAssistantResponse, recoverAssistantResponse } from './chatgpt-response-observer.mjs';
+import { canReconcileChatGptSession, mergeServerObservation, readServerResponse } from './chatgpt-server-response.mjs';
 import { diagnosticsEnabled, captureFailureDiagnostics } from './failure-diagnostics.mjs';
 import { recordActiveLease } from './tab-lease-store.mjs';
 import { createChatGptEditorAdapter } from './vendor-editor-contract.mjs';
@@ -197,15 +199,22 @@ export async function statusWebAi(deps, input = {}) {
     // a fail row instead of throwing before any rows are collected. The strict
     // host-required path stays available for send/poll via requireChatGptPage().
     const page = await deps.getPage();
-    const capabilities = await runCapabilities(deps, chatGptCapabilities, input);
+    const stored = input.session ? await readSessionAsync(input.session) : null;
+    const server = canReconcileChatGptSession(stored) ? await readServerResponse(page, stored) : null;
+    const capabilities = server ? await withPollDeadline(() => runCapabilities(deps, chatGptCapabilities, input), {
+        timeoutMs: 2_000, onExpired: () => [],
+    }) : await runCapabilities(deps, chatGptCapabilities, input);
     const worst = worstCapabilityState(capabilities);
     return {
-        ok: worst !== 'fail',
+        ok: worst !== 'fail' && server?.state !== 'blocked',
         vendor: input.vendor || 'chatgpt',
-        status: worst === 'fail' ? 'blocked' : 'ready',
+        status: worst === 'fail' || server?.state === 'blocked' ? 'blocked' : 'ready',
         url: page.url(),
         capabilities,
         capabilityState: worst,
+        ...(server ? { providerState: server.state, responseAvailable: server.state === 'complete',
+            responseMessageId: server.responseMessageId || null, responseChars: server.answerText?.length || 0,
+            providerObservationReason: server.reason || null } : {}),
         warnings: [],
     };
 }
@@ -289,6 +298,13 @@ const CHATGPT_RATE_LIMIT_DIALOG_PATTERNS = [
  * @returns {Promise<{ text: string, pattern: string }|null>}
  */
 async function readChatGptRateLimitDialog(page) {
+    return withPollDeadline(() => readChatGptRateLimitDialogUnbounded(page), {
+        timeoutMs: 2_000, onExpired: () => null,
+    });
+}
+
+/** @param {any} page */
+async function readChatGptRateLimitDialogUnbounded(page) {
     let dialogs;
     try {
         dialogs = await page.locator('[role="dialog"]').all();
@@ -763,7 +779,7 @@ export async function verifySentAttachments(page, uploadFiles, evidence, verifyA
 async function readAssistantTurnOrdering(page) {
     let verdict;
     try {
-        verdict = await page.evaluate(readAssistantTurnOrderingInPage, CHATGPT_TURN_SELECTORS);
+        verdict = await evaluateWithTimeout(page, readAssistantTurnOrderingInPage, CHATGPT_TURN_SELECTORS, 2_000);
     } catch {
         return 'unknown';
     }
@@ -930,7 +946,7 @@ export async function pollWebAi(deps, input = {}) {
         // caller was promised cannot be rounded up.
         const remainderMs = storedDeadlineRemainderMs(session, started);
         if (remainderMs !== null) {
-            if (remainderMs <= 0) {
+            if (remainderMs <= 0 && !canReconcileChatGptSession(session)) {
                 // Already past. Return before touching the browser at all —
                 // opening a page to immediately abandon it is work nobody is
                 // waiting for, and the observation ledger is empty either way.
@@ -946,7 +962,10 @@ export async function pollWebAi(deps, input = {}) {
                 }
                 return buildHardTimeoutResult(input, expiredObservations);
             }
-            timeoutMs = remainderMs;
+            // The stored generation wait expired, not the provider response.
+            // Give reconciliation a bounded call budget without changing that
+            // deadline or submitting another prompt.
+            timeoutMs = remainderMs > 0 ? remainderMs : 30_000;
         } else {
             // No stored deadline: fall back to the tier/vendor default, which
             // the resolver owns. Anchored at `started` rather than its own
@@ -961,8 +980,9 @@ export async function pollWebAi(deps, input = {}) {
     // indistinguishable from a clean one.
     /** @type {Set<string>} */
     const observations = new Set();
-    return withPollDeadline(
-        (hardDeadline, runToken) => runPollWebAi(deps, input, hardDeadline, observations, runToken),
+    const progress = { observation: input.continuationObservation || null, eligible: false, observedThisCall: false };
+    const result = await withPollDeadline(
+        (hardDeadline, runToken) => runPollWebAi(deps, input, hardDeadline, observations, runToken, progress),
         {
             startedAt: started,
             monotonicStartMs: monotonicStart,
@@ -980,6 +1000,83 @@ export async function pollWebAi(deps, input = {}) {
             },
         },
     );
+    if (['timeout', 'polling', 'awaiting-response'].includes(result?.status) && progress.eligible) {
+        const observation = progress.observedThisCall && progress.observation
+            ? mergeServerObservation(progress.observation, progress.observation) : null;
+        const verified = observation?.progressVerified === true;
+        return { ...result, ok: verified, status: verified ? 'polling' : 'awaiting-response',
+            terminal: false, waitExpired: true, providerState: observation?.state || 'unknown',
+            progressVerified: verified, ...(observation ? { providerObservation: observation } : {}),
+            errorCode: verified ? undefined : 'poll.wait-expired', stage: 'poll-wait',
+            error: verified ? undefined : 'This wait ended without a verified final response; provider completion is unverified',
+            retryHint: 'poll-or-resume', recoverable: true };
+    }
+    return result;
+}
+
+/**
+ * Server proof is independent of visibility, but never independent of the
+ * session's exact turn/generation/target. Use the existing file-policy and
+ * finalization paths; no focus, reload, new tab or new prompt is needed.
+ * @param {any} deps
+ * @param {any} input
+ * @param {any} session
+ * @param {any} page
+ * @param {() => boolean} stillActive
+ * @param {any} progress
+ * @returns {Promise<any>}
+ */
+async function reconcileServerAnswer(deps, input, session, page, stillActive, progress) {
+    if (!canReconcileChatGptSession(session) || input.outputImage !== undefined
+        || resolveFileArtifactPolicy(input, session) === 'require-all') return null;
+    if (session.targetId && (await readTargetIdentity(deps, session)).verdict !== 'verified') return null;
+    const expectedGeneration = input.generation || sessionGeneration(session);
+    const proof = await readServerResponse(page, session);
+    if (!stillActive()) throw POLL_EXPIRED;
+    if (!await isSessionGenerationCurrent(session.sessionId, expectedGeneration)) {
+        return buildGenerationSupersededResult('chatgpt', session, expectedGeneration);
+    }
+    if (proof.state === 'blocked') return {
+        ok: false, vendor: 'chatgpt', status: 'blocked', sessionId: session.sessionId,
+        generation: expectedGeneration, url: page.url(), answerText: '', recoverable: true,
+        errorCode: 'provider.interstitial', stage: 'provider-interstitial', retryHint: 'wait-and-retry',
+        warnings: ['provider-rate-limited'], evidence: { httpStatus: 429, source: 'conversation' },
+    };
+    if (proof.state === 'unknown') return null;
+    if (session.targetId && (await readTargetIdentity(deps, session)).verdict !== 'verified') return null;
+    const observation = mergeServerObservation(progress.observation || session.responseObservation, proof);
+    progress.observation = observation;
+    progress.observedThisCall = true;
+    const observed = await mutateSessionForGeneration(session.sessionId, expectedGeneration, current => {
+        if (current.targetId !== session.targetId || current.submittedUserMessageId !== session.submittedUserMessageId
+            || extractDurableConversationId(page.url()) !== proof.conversationId) return null;
+        return { responseObservation: observation,
+            ...(current.status === 'timeout' ? { status: 'polling', lastError: null } : {}),
+            ...(proof.state === 'complete' ? { responseMessageId: proof.responseMessageId, responseTurnId: null } : {}) };
+    }, stillActive);
+    if (observed === DEADLINE_PASSED) throw POLL_EXPIRED;
+    if (observed === GENERATION_CHANGED || !observed
+        || observed.targetId !== session.targetId || observed.submittedUserMessageId !== proof.submittedUserMessageId) {
+        return buildGenerationSupersededResult('chatgpt', session, expectedGeneration);
+    }
+    if (proof.state !== 'complete') return null;
+    // A stale DOM may expose files from an earlier turn. This path recovers
+    // verified text only; required-file/image requests stay on their existing
+    // capture path rather than accepting unrelated artifacts as proof.
+    const warnings = ['response-recovered-from-server', 'file-artifacts-not-probed-server-recovery'];
+    const baseline = sessionToBaseline(session);
+    if (!input.skipFinalize) {
+        const finalized = await finalizeProviderTab(deps, { vendor: 'chatgpt', session: observed, page,
+            generation: expectedGeneration, answerText: proof.answerText, warnings,
+            // Recovery must not start UI mutations on a stale background page.
+            archiveFlag: 'never', stillActive });
+        if (!stillActive()) throw POLL_EXPIRED;
+        if (!finalized.finalized) return buildGenerationSupersededResult('chatgpt', session, expectedGeneration);
+    }
+    return withAnswerArtifact({ ok: true, vendor: 'chatgpt', status: 'complete', sessionId: session.sessionId,
+        generation: expectedGeneration, targetId: session.targetId, conversationId: proof.conversationId,
+        responseMessageId: proof.responseMessageId, url: page.url(), answerText: proof.answerText,
+        baseline, usedFallbacks: ['server-conversation'], warnings, providerState: 'complete' });
 }
 
 /**
@@ -994,6 +1091,9 @@ function buildHardTimeoutResult(input, observations) {
         ok: false,
         vendor: input.vendor || 'chatgpt',
         status: 'timeout',
+        terminal: false,
+        waitExpired: true,
+        providerState: 'unknown',
         ...(input.session ? { sessionId: input.session } : {}),
         answerText: '',
         usedFallbacks: [],
@@ -1013,8 +1113,9 @@ function buildHardTimeoutResult(input, observations) {
  * @param {number} hardDeadlineAt
  * @param {Set<string>} [sharedObservations]
  * @param {{ expired: boolean, hardDeadline: number }} [sharedRun] commit token owned by the wrapper
+ * @param {{ observation: any, eligible?: boolean, observedThisCall?: boolean }} [progress]
  */
-async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_INFINITY, sharedObservations, sharedRun) {
+async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_INFINITY, sharedObservations, sharedRun, progress = { observation: null }) {
     const vendor = input.vendor || 'chatgpt';
     const boundSession = input.session ? await readSessionAsync(input.session) : null;
     if (boundSession && Number.isInteger(Number(input.generation)) && Number(input.generation) > 0
@@ -1022,6 +1123,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         return buildGenerationSupersededResult(vendor, boundSession, Number(input.generation));
     }
     assertSessionPollable(boundSession);
+    progress.eligible = canReconcileChatGptSession(boundSession);
     // Read through the awaited lock: this runs inside the armed deadline, and
     // the blocking form suspends the timer enforcing it.
     const timeout = Math.max(1, Number(input.timeout) > 0
@@ -1050,6 +1152,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         return buildGenerationSupersededResult(vendor, session, expectedGeneration);
     }
     assertSessionPollable(session);
+    progress.eligible = canReconcileChatGptSession(session);
     // B23: a corrupt store collapses to an empty one, so a failed read looks
     // exactly like "no session". The flag is read HERE, right after the lookup,
     // so the observation is about this read and not some later one.
@@ -1182,6 +1285,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
     let stableSnapshot = null;
     let stableSince = 0;
     let lastHeartbeat = 0;
+    let nextServerProbeAt = 0;
     const submittedUserMessageId = typeof session?.submittedUserMessageId === 'string'
         ? session.submittedUserMessageId
         : null;
@@ -1207,6 +1311,11 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         try {
         if (session && !await isSessionGenerationCurrent(session.sessionId, expectedGeneration)) {
             return buildGenerationSupersededResult(vendor, session, expectedGeneration);
+        }
+        if (session && Date.now() >= nextServerProbeAt) {
+            nextServerProbeAt = Date.now() + 15_000;
+            const serverResult = await reconcileServerAnswer(deps, { ...input, generation: expectedGeneration }, session, page, isActiveRun, progress);
+            if (serverResult) return serverResult;
         }
         let identityOk = true;
         if (session?.targetId) {
@@ -1393,6 +1502,14 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         // trace — no longer freezes the stability window; it only demands a
         // longer quiet period before we accept completion.
         const streaming = activity.strength === 'strong';
+        if (progress.eligible && identityOk && latest && progress.observation?.source !== 'conversation') {
+            progress.observedThisCall = true;
+            progress.observation = mergeServerObservation(progress.observation || input.continuationObservation, {
+                source: 'dom', state: streaming ? 'generating' : 'pending',
+                fingerprint: `${latestSnapshot?.messageId || ''}:${createHash('sha256').update(latest).digest('hex')}`,
+                observedAt: new Date().toISOString(),
+            });
+        }
         // An unobserved verdict buys the same longer quiet window as weak
         // activity: we cannot claim the page went quiet if we could not read it.
         const weakActive = activity.strength === 'weak' || activity.strength === 'unknown';
@@ -1819,6 +1936,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         // Awaited + post-lock gated: the sync form decided before the blocking
         // lock, so a loser could still record a timeout after its caller
         // returned. DEADLINE_PASSED keeps the throw semantics of the old gate.
+        if (progress.eligible) return buildHardTimeoutResult(input, observations);
         const timedOutRow = session ? await markSessionTimeoutForGeneration(session.sessionId, expectedGeneration, {
             lastError: { errorCode: 'provider.poll-timeout', message: 'timed out waiting for answer' },
         }, isActiveRun) : null;
@@ -1845,6 +1963,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         }, observations);
     }
     // Same contract as the copy-markdown branch above: gate under the lock.
+    if (progress.eligible) return buildHardTimeoutResult(input, observations);
     const timedOutRow = session ? await markSessionTimeoutForGeneration(session.sessionId, expectedGeneration, {
         lastError: { errorCode: 'provider.poll-timeout', message: 'timed out waiting for answer' },
     }, isActiveRun) : null;
@@ -1881,6 +2000,14 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
  * @returns {Promise<import('./chatgpt-response-dom.mjs').ChatGptActivityState>}
  */
 async function readActivityState(page) {
+    return withPollDeadline(() => readActivityStateUnbounded(page), {
+        timeoutMs: 2_000,
+        onExpired: () => ({ strength: 'unknown', evidence: 'activity-probe-timeout' }),
+    });
+}
+
+/** @param {any} page */
+async function readActivityStateUnbounded(page) {
     // The composer-scoped stop probe runs FIRST: it is the strongest, cheapest
     // signal, and a page double whose `evaluate` cannot honor the options object
     // would otherwise report `none` while a stop button is plainly visible.
@@ -1934,7 +2061,7 @@ async function isStreaming(page) {
  */
 async function isResponseFinished(page, sample, minTurnIndex) {
     try {
-        const result = await page.evaluate(
+        const result = await evaluateWithTimeout(page,
             ({ finishedSelector, sample, minTurnIndex, resolverSource, selectors }) => {
             const resolver = (0, eval)(`(${resolverSource})`);
             const turns = resolver(selectors);
@@ -1960,7 +2087,7 @@ async function isResponseFinished(page, sample, minTurnIndex) {
             minTurnIndex,
             resolverSource: resolveTopLevelAssistantTurns.toString(),
             selectors: CHATGPT_ASSISTANT_SELECTORS,
-        });
+        }, 2_000);
         if (result === true) {
             return {
                 finished: true,
@@ -1992,7 +2119,7 @@ async function isResponseFinished(page, sample, minTurnIndex) {
  */
 export async function queryWebAi(deps, input = {}) {
     const sent = await sendWebAi(deps, input);
-    const result = await pollWebAi(deps, {
+    const pollInput = {
         vendor: sent.vendor,
         timeout: input.timeout,
         session: sent.sessionId,
@@ -2004,7 +2131,17 @@ export async function queryWebAi(deps, input = {}) {
         fileArtifactPolicy: input.fileArtifactPolicy,
         archiveFlag: input.archiveFlag,
         skipFinalize: input.skipFinalize,
-    });
+    };
+    let result = await pollWebAi(deps, pollInput);
+    // A call budget expiring is not a failed generation. Continue only with
+    // correlated progress evidence, keeping the same session and generation.
+    // Each continuation is bounded; unchanged evidence ages out rather than
+    // turning a stale "stop" indicator into an endless wait.
+    while (result.status === 'polling' && result.progressVerified === true) {
+        process.stderr.write('[poll] wait budget elapsed; verified request still progressing, continuing same session\n');
+        result = await pollWebAi(deps, { ...pollInput, timeout: 60,
+            continuationObservation: result.providerObservation });
+    }
     const resultAny = /** @type {any} */ (result);
     const sentAny = /** @type {any} */ (sent);
     return {
@@ -2458,7 +2595,7 @@ async function readAssistantSnapshotsSplit(page, anchor = {}) {
             submittedUserTurnId: anchor.submittedUserTurnId || null,
             responseMessageId: anchor.responseMessageId || null,
             responseTurnId: anchor.responseTurnId || null,
-        });
+        }, 2_000);
         if (!result || typeof result !== 'object'
             || !Array.isArray(result.wrapped)
             || !Array.isArray(result.wrapperless)) return failed;

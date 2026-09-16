@@ -58,7 +58,7 @@ describe('web-ai watcher transient-timeout promotion (source-string contract)', 
 
     it('promotes a pre-deadline timeout only for the generation that observed it', () => {
         expect(watcherSrc).toMatch(
-            /session\.status === 'timeout' && !isDeadlineExpired\(session\.deadlineAt\)[\s\S]*?restorePollingBeforeDeadline\([\s\S]*?generation/,
+            /resumingTimeout && !isDeadlineExpired\(session\.deadlineAt\)[\s\S]*?restorePollingBeforeDeadline\([\s\S]*?generation/,
         );
     });
 
@@ -67,13 +67,52 @@ describe('web-ai watcher transient-timeout promotion (source-string contract)', 
         expect(watcherSrc).toContain("errorCode: 'session.generation-superseded'");
     });
 
-    it('still treats a deadline-expired timeout as terminal', () => {
-        expect(watcherSrc).toMatch(/if\s*\(\s*TERMINAL_SESSION_STATUSES\.has\(session\.status\)\s*\)\s*\{[\s\S]*?terminal:\s*true/);
-        expect(watcherSrc).toMatch(/if\s*\(\s*isDeadlineExpired\(session\.deadlineAt\)\s*\)\s*\{[\s\S]*?status:\s*'timeout'/);
+    it('preserves legacy terminal behavior but reconciles exact Chat requests after expiry', () => {
+        expect(watcherSrc).toContain('TERMINAL_SESSION_STATUSES.has(session.status) && !resumingTimeout');
+        expect(watcherSrc).toContain('isDeadlineExpired(session.deadlineAt) && !reconcilable');
     });
 
     it('appends a watcher-resumed-transient-timeout warning when promoting', () => {
         expect(watcherSrc).toContain('watcher-resumed-transient-timeout');
+    });
+});
+
+describe('watch reconciles an exact request beyond its stored deadline', () => {
+    it('checks and recovers an expired response instead of declaring no answer', async () => {
+        const session = createWatcherSession({ deadlineAt: new Date(Date.now() - 60_000).toISOString() });
+        updateSession(session.sessionId, { submittedUserMessageId: 'user-1', status: 'timeout' });
+        const budgets = [];
+        pollState.impl = async (_deps, input) => {
+            budgets.push(Number(input.timeout));
+            updateSession(session.sessionId, { status: 'complete', answer: 'late real answer', completedAt: new Date().toISOString() });
+            return { ok: true, status: 'complete', answerText: 'late real answer' };
+        };
+        const result = await watchSessionOnce(baseDeps(), { session: session.sessionId, pollTimeoutSec: 30 });
+        expect(result).toMatchObject({ status: 'complete', answerText: 'late real answer' });
+        expect(budgets).toEqual([30]);
+    });
+    it('continues verified work after expiry and exits when the answer arrives', async () => {
+        const session = createWatcherSession({ deadlineAt: new Date(Date.now() - 60_000).toISOString() });
+        updateSession(session.sessionId, { submittedUserMessageId: 'user-1' });
+        let count = 0;
+        pollState.impl = async () => {
+            if (++count === 1) return { ok: true, status: 'polling', progressVerified: true, providerState: 'generating', waitExpired: true };
+            updateSession(session.sessionId, { status: 'complete', answer: 'done', completedAt: new Date().toISOString() });
+            return { ok: true, status: 'complete', answerText: 'done' };
+        };
+        const events = [];
+        const result = await watchSession(baseDeps(), { session: session.sessionId, intervalMs: 1 }, async e => events.push(e));
+        expect(result.status).toBe('complete'); expect(count).toBe(2);
+        expect(events.find(e => e.type === 'watch.tick')).toMatchObject({ status: 'polling', terminal: false });
+    });
+    it('reports unverified response state without spinning or killing the session', async () => {
+        const session = createWatcherSession({ deadlineAt: new Date(Date.now() - 60_000).toISOString() });
+        updateSession(session.sessionId, { submittedUserMessageId: 'user-1' });
+        pollState.impl = vi.fn(async () => ({ ok: false, status: 'awaiting-response', providerState: 'unknown', retryHint: 'poll-or-resume' }));
+        const result = await watchSession(baseDeps(), { session: session.sessionId, intervalMs: 1 }, async () => {});
+        expect(result).toMatchObject({ ok: false, status: 'awaiting-response', final: { terminal: false } });
+        expect(pollState.impl).toHaveBeenCalledTimes(1);
+        expect(getSession(session.sessionId)).toMatchObject({ status: 'polling', answer: null });
     });
 });
 

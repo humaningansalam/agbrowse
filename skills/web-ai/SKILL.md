@@ -113,6 +113,28 @@ Timeout resolution is `explicit timeout → stored session deadline remainder �
 default → vendor fallback`. A resumed poll therefore keeps the deadline created by
 the original submit unless the caller explicitly overrides it.
 
+For ChatGPT Chat sessions with an exact submitted-message ID, expiry is a wait
+budget, not evidence that the provider failed or has no answer. `poll`/`resume`
+can reconcile the same request after its stored deadline without resubmitting.
+`query` continues in bounded slices when correlated progress is verified;
+`watch` likewise keeps waiting beyond the deadline while progress is verified.
+A stale stop button alone is not progress. Unchanged evidence ages out after
+five minutes; that means **progress is unverified**, not that GPT was stopped.
+
+When no final or ongoing progress can be verified after the wait, the result is
+`awaiting-response`, `terminal: false`, `recoverable: true`, and
+`retryHint: poll-or-resume`. Keep the same ID. Never translate this or a host
+request timeout into “GPT did not answer.” Rate limits still return `blocked`
+and `wait-and-retry`; do not repeatedly retry through a provider block.
+
+ChatGPT final text is reconciled through the same logged-in browser context,
+independent of which tab is selected. Only the current branch after the exact
+submitted user message is eligible. No focus switch, reload, or new prompt is
+required. `status --session` reports `providerState` and `responseAvailable`;
+`sessions show` is only the persisted record, not a live provider observation.
+The text recovery path does not satisfy required file/image capture and reports
+`file-artifacts-not-probed-server-recovery` rather than borrowing old DOM files.
+
 | Long-running tier | Default `--timeout` | Roughly |
 | --- | ---: | --- |
 | `chatgpt-pro` | 5400 | 90 minutes |
@@ -180,6 +202,9 @@ Key facts (verified 2026-06-11, details in
   every 15s by default, then `watch.complete`/`watch.timeout`/`watch.error`)
   and exits on terminal status. Parse the last terminal line, then fetch the
   full answer with `sessions show <SID> --json`.
+- `watch.blocked` and `watch.awaiting-response` end that watcher invocation
+  without destroying the session. Read the result fields, retain the same ID,
+  and resume appropriately; process exit alone is not provider completion.
 - A per-session watcher lock makes concurrent/duplicate `watch` calls fail
   closed and auto-recovers stale locks from dead processes — re-running
   `watch` after a crash is safe.
@@ -210,6 +235,15 @@ agbrowse web-ai poll --session "$SID" --json
 agbrowse web-ai snapshot --session "$SID" --json
 agbrowse web-ai stop --session "$SID" --json
 ```
+
+Record each returned ID with its role (for example Director versus domain
+expert), conversation URL, and generation in the caller's own task/handoff.
+Never replace a lost ID with a tab title, active tab, or newest global session.
+Recover it from that caller's original send receipt. A shared `sessions list`
+does not prove ownership. A title is a display label, never session identity.
+When another command owns the target, do not start duplicate poll/watch jobs;
+`active-command.target-owned` means reuse the existing command. A rejected
+command does not change the owner's deadline or answer.
 
 `poll`, `stop`, `watch`, and `snapshot` reject calls without `--session`. They
 never inspect the active tab, tab index, provider origin, or most-recent tab.

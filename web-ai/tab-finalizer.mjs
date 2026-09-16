@@ -96,6 +96,8 @@ export async function finalizeProviderTab(deps, {
         status: 'complete',
         conversationUrl,
         answer: answerText,
+        lastError: null,
+        lastResponseCharCount: typeof answerText === 'string' ? answerText.length : 0,
         warnings: baseWarnings,
         completedAt: new Date().toISOString(),
     }, () => !expired());
