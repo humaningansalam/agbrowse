@@ -1,5 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { readServerResponse, selectServerResponse } from '../../web-ai/chatgpt-server-response.mjs';
+
+let home, previousHome;
+beforeEach(async () => {
+    previousHome = process.env.BROWSER_AGENT_HOME;
+    home = await mkdtemp(join(tmpdir(), 'agbrowse-server-response-'));
+    process.env.BROWSER_AGENT_HOME = home;
+});
+afterEach(async () => {
+    if (previousHome === undefined) delete process.env.BROWSER_AGENT_HOME;
+    else process.env.BROWSER_AGENT_HOME = previousHome;
+    await rm(home, { recursive: true, force: true });
+});
 
 const session = { conversationId: 'conversation-A', submittedUserMessageId: 'user-A' };
 function fixture() {

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSession, updateSession, getSession, beginSessionGeneration } from '../../web-ai/session.mjs';
-import { pollWebAi } from '../../web-ai/chatgpt.mjs';
+import { pollWebAi, statusWebAi } from '../../web-ai/chatgpt.mjs';
 import { mergeServerObservation } from '../../web-ai/chatgpt-server-response.mjs';
 
 // Keep the real session store, correlation, poll deadline, and finalizer. Pool
@@ -77,13 +77,71 @@ describe('poll recovers a completed background response', () => {
         expect(result).toMatchObject({ status: 'complete', responseMessageId: 'response-owned' });
         expect(getSession(session.sessionId).deadlineAt).toBe(session.deadlineAt);
     });
-    it('returns a recoverable interstitial on HTTP 429 without changing the session', async () => {
+    it('does not turn a throttled recovery GET into a provider interstitial', async () => {
         const { session, deps, page } = setup();
-        page.request.get.mockResolvedValue({ status: () => 429, dispose: async () => {} });
-        const result = await pollWebAi(deps, { session: session.sessionId, timeout: 1 });
-        expect(result).toMatchObject({ status: 'blocked', errorCode: 'provider.interstitial',
-            stage: 'provider-interstitial', retryHint: 'wait-and-retry', recoverable: true,
-            sessionId: session.sessionId, warnings: ['provider-rate-limited'] });
+        page.request.get.mockResolvedValue({ status: () => 429, headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
+        const result = await pollWebAi(deps, { session: session.sessionId, timeout: 0.15 });
+        expect(result).toMatchObject({ status: 'awaiting-response', errorCode: 'poll.wait-expired',
+            terminal: false, retryHint: 'poll-or-resume', recoverable: true,
+            sessionId: session.sessionId });
+        expect(result.warnings).toContain('server-probe-rate-limited');
+        expect(result.warnings).not.toContain('provider-rate-limited');
+        expect(getSession(session.sessionId)).toEqual(session);
+    });
+
+    it('still captures an exact DOM final while the optional server probe is throttled', async () => {
+        const { session, deps, page } = setup();
+        page.request.get.mockResolvedValue({ status: () => 429, headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
+        let now = Date.now();
+        vi.spyOn(Date, 'now').mockImplementation(() => now);
+        page.waitForTimeout = async ms => { now += ms; await new Promise(resolve => setImmediate(resolve)); };
+        const sample = { text: 'The exact DOM final despite a throttled recovery GET.', messageId: 'dom-final',
+            turnId: 'conversation-turn-2', turnIndex: 1, source: 'wrapped', domOrder: 0 };
+        page.evaluate.mockImplementation(async (fn, arg) => {
+            const source = String(fn);
+            if (source.startsWith('function readAssistantSnapshotSources')) return {
+                ok: true, userAnchorFound: true, responseAnchorFound: false, wrapped: [sample], wrapperless: [] };
+            if (source.startsWith('function readChatGptStreamingState')) return { strength: 'none', evidence: '' };
+            if (source.startsWith('function readAssistantTurnOrderingInPage')) return 'ordered';
+            if (arg?.finishedSelector) return { ...sample, finished: true };
+            return null;
+        });
+        const result = await pollWebAi(deps, { session: session.sessionId, timeout: 30, skipFinalize: true });
+        expect(result).toMatchObject({ status: 'complete', answerText: sample.text });
+        expect(result.warnings).toContain('server-probe-rate-limited');
+        expect(page.request.get).toHaveBeenCalledTimes(1);
+        expect(page.bringToFront).not.toHaveBeenCalled();
+    });
+
+    it('resumes the same generation and recovers its server final after cooldown', async () => {
+        const { session, deps, page, conversation } = setup();
+        const get = page.request.get.getMockImplementation();
+        page.request.get.mockResolvedValueOnce({ status: () => 429,
+            headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
+        const paused = await pollWebAi(deps, { session: session.sessionId, timeout: 0.15 });
+        expect(paused).toMatchObject({ status: 'awaiting-response', terminal: false,
+            serverProbe: { reason: 'probe-rate-limited', endpoint: 'auth-session', httpStatus: 429 } });
+        expect(getSession(session.sessionId)).toEqual(session);
+        vi.spyOn(Date, 'now').mockReturnValue(Date.parse(paused.serverProbe.retryAt) + 1);
+        page.request.get.mockImplementation(get);
+        const final = await pollWebAi(deps, { session: session.sessionId, generation: session.generation, timeout: 2 });
+        expect(final).toMatchObject({ status: 'complete', responseMessageId: 'response-owned',
+            answerText: conversation.mapping['response-owned'].message.content.parts[0] });
+        expect(getSession(session.sessionId)).toMatchObject({ generation: session.generation,
+            submittedUserMessageId: session.submittedUserMessageId, answer: final.answerText });
+        expect(page.goto).not.toHaveBeenCalled(); expect(page.reload).not.toHaveBeenCalled();
+    });
+
+    it('status distinguishes an unverified response from a provider block or missing answer', async () => {
+        const { session, deps, page } = setup();
+        page.request.get.mockResolvedValue({ status: () => 429,
+            headers: () => ({ 'retry-after': '120' }), dispose: async () => {} });
+        page.locator = () => ({ first: () => ({ isVisible: async () => true }) });
+        const result = await statusWebAi(deps, { session: session.sessionId });
+        expect(result).toMatchObject({ ok: true, status: 'ready', providerState: 'unknown',
+            responseAvailable: null, providerObservationReason: 'probe-rate-limited',
+            warnings: ['server-probe-rate-limited'] });
+        expect(Date.parse(result.serverProbeRetryAt)).toBeGreaterThan(Date.now());
         expect(getSession(session.sessionId)).toEqual(session);
     });
     it('continues only with fresh progress and does not carry it through a failed browser probe', async () => {

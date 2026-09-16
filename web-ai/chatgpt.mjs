@@ -212,10 +212,11 @@ export async function statusWebAi(deps, input = {}) {
         url: page.url(),
         capabilities,
         capabilityState: worst,
-        ...(server ? { providerState: server.state, responseAvailable: server.state === 'complete',
+        ...(server ? { providerState: server.state, responseAvailable: server.state === 'unknown' ? null : server.state === 'complete',
             responseMessageId: server.responseMessageId || null, responseChars: server.answerText?.length || 0,
-            providerObservationReason: server.reason || null } : {}),
-        warnings: [],
+            providerObservationReason: server.reason || null,
+            ...(server.retryAt ? { serverProbeRetryAt: server.retryAt } : {}) } : {}),
+        warnings: server?.reason === 'probe-rate-limited' ? ['server-probe-rate-limited'] : [],
     };
 }
 
@@ -1007,6 +1008,7 @@ export async function pollWebAi(deps, input = {}) {
         return { ...result, ok: verified, status: verified ? 'polling' : 'awaiting-response',
             terminal: false, waitExpired: true, providerState: observation?.state || 'unknown',
             progressVerified: verified, ...(observation ? { providerObservation: observation } : {}),
+            ...(progress.probeDeferred ? { serverProbe: progress.probeDeferred } : {}),
             errorCode: verified ? undefined : 'poll.wait-expired', stage: 'poll-wait',
             error: verified ? undefined : 'This wait ended without a verified final response; provider completion is unverified',
             retryHint: 'poll-or-resume', recoverable: true };
@@ -1026,7 +1028,7 @@ export async function pollWebAi(deps, input = {}) {
  * @param {any} progress
  * @returns {Promise<any>}
  */
-async function reconcileServerAnswer(deps, input, session, page, stillActive, progress) {
+async function reconcileServerAnswer(deps, input, session, page, stillActive, progress, observations) {
     if (!canReconcileChatGptSession(session) || input.outputImage !== undefined
         || resolveFileArtifactPolicy(input, session) === 'require-all') return null;
     if (session.targetId && (await readTargetIdentity(deps, session)).verdict !== 'verified') return null;
@@ -1036,12 +1038,13 @@ async function reconcileServerAnswer(deps, input, session, page, stillActive, pr
     if (!await isSessionGenerationCurrent(session.sessionId, expectedGeneration)) {
         return buildGenerationSupersededResult('chatgpt', session, expectedGeneration);
     }
-    if (proof.state === 'blocked') return {
-        ok: false, vendor: 'chatgpt', status: 'blocked', sessionId: session.sessionId,
-        generation: expectedGeneration, url: page.url(), answerText: '', recoverable: true,
-        errorCode: 'provider.interstitial', stage: 'provider-interstitial', retryHint: 'wait-and-retry',
-        warnings: ['provider-rate-limited'], evidence: { httpStatus: 429, source: 'conversation' },
-    };
+    if (proof.reason === 'probe-rate-limited') {
+        observations.add('server-probe-rate-limited');
+        progress.probeDeferred = { reason: proof.reason, endpoint: proof.endpoint,
+            httpStatus: proof.httpStatus, retryAt: proof.retryAt };
+    }
+    // An optional GET failing is not a ChatGPT dialog, nor proof that the
+    // submitted request failed. Continue exact-turn DOM observation/capture.
     if (proof.state === 'unknown') return null;
     if (session.targetId && (await readTargetIdentity(deps, session)).verdict !== 'verified') return null;
     const observation = mergeServerObservation(progress.observation || session.responseObservation, proof);
@@ -1063,7 +1066,7 @@ async function reconcileServerAnswer(deps, input, session, page, stillActive, pr
     // A stale DOM may expose files from an earlier turn. This path recovers
     // verified text only; required-file/image requests stay on their existing
     // capture path rather than accepting unrelated artifacts as proof.
-    const warnings = ['response-recovered-from-server', 'file-artifacts-not-probed-server-recovery'];
+    const warnings = mergeObservationList(['response-recovered-from-server', 'file-artifacts-not-probed-server-recovery'], observations);
     const baseline = sessionToBaseline(session);
     if (!input.skipFinalize) {
         const finalized = await finalizeProviderTab(deps, { vendor: 'chatgpt', session: observed, page,
@@ -1314,7 +1317,7 @@ async function runPollWebAi(deps, input = {}, hardDeadlineAt = Number.POSITIVE_I
         }
         if (session && Date.now() >= nextServerProbeAt) {
             nextServerProbeAt = Date.now() + 15_000;
-            const serverResult = await reconcileServerAnswer(deps, { ...input, generation: expectedGeneration }, session, page, isActiveRun, progress);
+            const serverResult = await reconcileServerAnswer(deps, { ...input, generation: expectedGeneration }, session, page, isActiveRun, progress, observations);
             if (serverResult) return serverResult;
         }
         let identityOk = true;

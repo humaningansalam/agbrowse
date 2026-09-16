@@ -135,6 +135,16 @@ required. `status --session` reports `providerState` and `responseAvailable`;
 The text recovery path does not satisfy required file/image capture and reports
 `file-artifacts-not-probed-server-recovery` rather than borrowing old DOM files.
 
+An HTTP 429 from the optional auth/conversation GET is **not** a ChatGPT
+generation block. It produces `server-probe-rate-limited`; exact-turn DOM
+observation and answer capture continue. The probe respects `Retry-After`
+(at least 60 seconds), with a cooldown shared by CLI processes under the same
+`BROWSER_AGENT_HOME`. Do not restart the command or send a new prompt to evade
+that cooldown. Real visible rate-limit dialogs still return `blocked`.
+An unverified `status --session` reports `responseAvailable: null`, not proof
+that there is no answer. A wait may end with `awaiting-response` and diagnostic
+`serverProbe.retryAt`; keep the same ID for the next poll/resume.
+
 | Long-running tier | Default `--timeout` | Roughly |
 | --- | ---: | --- |
 | `chatgpt-pro` | 5400 | 90 minutes |

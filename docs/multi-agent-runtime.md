@@ -97,7 +97,16 @@ It must not be translated into “GPT has no answer.” A watcher before its sto
 deadline can keep observing; after expiry it exits with `watch.awaiting-response`
 unless progress is verified. `status --session` exposes `providerState` and
 `responseAvailable`; `sessions show` remains a read-only persisted snapshot.
-HTTP 429 and visible rate-limit dialogs stop polling as recoverable blocks.
+Only an actual visible rate-limit dialog is a recoverable provider block.
+HTTP 429 from the optional auth/conversation GET is `server-probe-rate-limited`,
+not proof of a stopped generation. Poll continues exact-turn DOM capture while
+the probe honors `Retry-After` (at least 60 seconds). A separate control file,
+`web-ai-server-probe-backoff.json`, shares the cooldown and an in-flight probe
+reservation across processes in the same `BROWSER_AGENT_HOME`; it stores no
+credentials, conversation IDs, or answer content. Session records are unchanged
+by the throttle. `status --session` reports `responseAvailable: null` for an
+unverified probe and exposes `serverProbeRetryAt`. Wait results may include
+`serverProbe.retryAt`; callers retain the same session and must not resend.
 
 Target ownership is acquired before page binding/recovery and explicit poll/resume/watch
 deadline updates. Async-local lease context separates concurrent callers from
@@ -110,7 +119,8 @@ role). Director and expert IDs are separate. Global lists, titles and the
 currently visible tab are never ownership evidence or substitutes for a lost ID.
 
 New coverage: `cli-output-drain.test.mjs`, `web-ai-server-response.test.mjs`,
-`web-ai-server-recovery-poll.test.mjs`, plus shared-target and watcher tests cover
+`web-ai-server-recovery-poll.test.mjs`, `web-ai-server-probe-rate-limit.test.mjs`,
+plus shared-target and watcher tests cover
 large slow pipes, stalled renderers, late completion, branch/identity rejection,
 generation races, unchanged progress, strict-file policy, and write-free rejection.
 

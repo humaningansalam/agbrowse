@@ -1,10 +1,10 @@
 {
-  "generated_at": "2026-09-16T06:41:06.479Z",
-  "total_mjs": 416,
+  "generated_at": "2026-09-16T09:13:46.431Z",
+  "total_mjs": 419,
   "fan_in": {
     "web-ai/session.mjs": 43,
     "web-ai/errors.mjs": 41,
-    "web-ai/session-store.mjs": 20,
+    "web-ai/session-store.mjs": 21,
     "web-ai/chatgpt.mjs": 16,
     "web-ai/tab-recovery.mjs": 16,
     "web-ai/session-artifacts.mjs": 14,
@@ -22,10 +22,10 @@
     "web-ai/vendor-editor-contract.mjs": 9,
     "skills/browser/tab-manager.mjs": 8,
     "web-ai/chatgpt-composer.mjs": 8,
+    "web-ai/chatgpt-server-response.mjs": 8,
     "web-ai/constants.mjs": 8,
     "skills/browser/runway-selectors.mjs": 7,
     "web-ai/chatgpt-attachments.mjs": 7,
-    "web-ai/chatgpt-server-response.mjs": 7,
     "web-ai/conversation-url.mjs": 7,
     "web-ai/copy-markdown.mjs": 7,
     "web-ai/tab-finalizer.mjs": 7,
@@ -232,7 +232,7 @@
     "web-ai/chatgpt-project-sources.mjs": 0,
     "web-ai/chatgpt-response-dom.mjs": 0,
     "web-ai/chatgpt-response-observer.mjs": 1,
-    "web-ai/chatgpt-server-response.mjs": 2,
+    "web-ai/chatgpt-server-response.mjs": 3,
     "web-ai/chatgpt-tools.mjs": 1,
     "web-ai/chatgpt-upload-surface.mjs": 0,
     "web-ai/chatgpt-work-picker.mjs": 8,
@@ -472,6 +472,7 @@
     "test/unit/web-ai-safe-conversation-url.test.mjs": 1,
     "test/unit/web-ai-self-heal-validation.test.mjs": 1,
     "test/unit/web-ai-self-heal.test.mjs": 1,
+    "test/unit/web-ai-server-probe-rate-limit.test.mjs": 1,
     "test/unit/web-ai-server-recovery-poll.test.mjs": 3,
     "test/unit/web-ai-server-response.test.mjs": 1,
     "test/unit/web-ai-session-artifacts.test.mjs": 2,
@@ -613,9 +614,13 @@
     "bin/agbrowse-vision-click.mjs": 1,
     "bin/agbrowse.mjs": 1,
     "benchmarks/agbrowse/run-task.mjs": 1,
-    "benchmarks/agbrowse/trajectory.mjs": 0
+    "benchmarks/agbrowse/trajectory.mjs": 0,
+    ".browser-agent/audits/v6-live-readonly.mjs": 0,
+    ".browser-agent/audits/v6-live-shadow-recovery.mjs": 0
   },
   "leaves": [
+    ".browser-agent/audits/v6-live-readonly.mjs",
+    ".browser-agent/audits/v6-live-shadow-recovery.mjs",
     "benchmarks/agbrowse/trajectory.mjs",
     "devlog/context/redesign-candidates/verify/capture.mjs",
     "scripts/agent-driven.mjs",
@@ -729,6 +734,8 @@
     "web-ai/types.mjs"
   ],
   "tiers": {
+    ".browser-agent/audits/v6-live-readonly.mjs": 0,
+    ".browser-agent/audits/v6-live-shadow-recovery.mjs": 0,
     "benchmarks/agbrowse/run-task.mjs": 1,
     "benchmarks/agbrowse/trajectory.mjs": 0,
     "bin/agbrowse-vision-click.mjs": 3,
@@ -992,6 +999,7 @@
     "test/unit/web-ai-safe-conversation-url.test.mjs": 6,
     "test/unit/web-ai-self-heal-validation.test.mjs": 5,
     "test/unit/web-ai-self-heal.test.mjs": 5,
+    "test/unit/web-ai-server-probe-rate-limit.test.mjs": 2,
     "test/unit/web-ai-server-recovery-poll.test.mjs": 8,
     "test/unit/web-ai-server-response.test.mjs": 2,
     "test/unit/web-ai-session-artifacts.test.mjs": 5,
@@ -1242,7 +1250,8 @@
     ],
     "web-ai/chatgpt-server-response.mjs": [
       "web-ai/conversation-url.mjs",
-      "web-ai/poll-deadline.mjs"
+      "web-ai/poll-deadline.mjs",
+      "web-ai/session-store.mjs"
     ],
     "web-ai/chatgpt-tools.mjs": [
       "web-ai/chatgpt-menu-resolver.mjs"
@@ -2193,6 +2202,9 @@
     "test/unit/web-ai-self-heal.test.mjs": [
       "web-ai/self-heal.mjs"
     ],
+    "test/unit/web-ai-server-probe-rate-limit.test.mjs": [
+      "web-ai/chatgpt-server-response.mjs"
+    ],
     "test/unit/web-ai-server-recovery-poll.test.mjs": [
       "web-ai/chatgpt-server-response.mjs",
       "web-ai/chatgpt.mjs",
@@ -2683,6 +2695,8 @@
     "benchmarks/agbrowse/run-task.mjs": [
       "benchmarks/agbrowse/trajectory.mjs"
     ],
-    "benchmarks/agbrowse/trajectory.mjs": []
+    "benchmarks/agbrowse/trajectory.mjs": [],
+    ".browser-agent/audits/v6-live-readonly.mjs": [],
+    ".browser-agent/audits/v6-live-shadow-recovery.mjs": []
   }
 }

@@ -1,9 +1,82 @@
 // @ts-check
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile, writeFile, rename, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { extractDurableConversationId } from './conversation-url.mjs';
 import { withPollDeadline } from './poll-deadline.mjs';
+import { withStoreLockAsync } from './session-store.mjs';
 
 const HOSTS = new Set(['chatgpt.com', 'chat.openai.com']);
+
+/** A throttled diagnostic GET says nothing about the submitted generation. */
+function throttledProbe(response, endpoint) {
+    let raw = '';
+    try { raw = String(response.headers?.()?.['retry-after'] || '').trim(); } catch { /* optional header */ }
+    const now = Date.now();
+    const hinted = /^\d+$/.test(raw) ? now + Number(raw) * 1000
+        : /[a-z]/i.test(raw) ? Date.parse(raw) : NaN;
+    const retryMs = Number.isFinite(hinted) && hinted <= 8.64e15 ? Math.max(now + 60_000, hinted) : now + 60_000;
+    return { state: 'unknown', source: 'conversation', reason: 'probe-rate-limited',
+        httpStatus: 429, endpoint, retryAt: new Date(retryMs).toISOString() };
+}
+
+/**
+ * Share backoff across CLI processes, not across session generations. The
+ * existing store lock protects only small control-file reads/writes, NEVER a
+ * network request. A reservation prevents concurrent probes from stampeding.
+ * No access tokens, conversation IDs, or answer content enter this file.
+ * ponytail: one conservative cooldown per BROWSER_AGENT_HOME; split by account
+ * only when independent profiles sharing one home require separate throughput.
+ * @param {() => Promise<any>} probe
+ * @param {number} timeoutMs
+ */
+async function withServerProbeBackoff(probe, timeoutMs) {
+    const path = join(process.env.BROWSER_AGENT_HOME || join(homedir(), '.browser-agent'), 'web-ai-server-probe-backoff.json');
+    const leaseId = randomUUID();
+    const started = Date.now();
+    const read = async () => {
+        try { return JSON.parse(await readFile(path, 'utf8')); }
+        catch (error) { if (error?.code === 'ENOENT') return {}; throw error; }
+    };
+    const write = async value => {
+        const temp = `${path}.${leaseId}.tmp`;
+        try {
+            await writeFile(temp, JSON.stringify(value), { mode: 0o600 });
+            await rename(temp, path);
+        } finally { await rm(temp, { force: true }).catch(() => {}); }
+    };
+    let reserved = false;
+    let result;
+    try {
+        const deferred = await withStoreLockAsync(async () => {
+            const state = await read();
+            if (Date.parse(state.retryAt || '') > Date.now()) return {
+                state: 'unknown', source: 'conversation', reason: 'probe-rate-limited',
+                httpStatus: 429, endpoint: state.endpoint, retryAt: state.retryAt,
+            };
+            if (Date.parse(state.leaseUntil || '') > Date.now()) return {
+                state: 'unknown', source: 'conversation', reason: 'probe-busy', retryAt: state.leaseUntil,
+            };
+            await write({ version: 1, leaseId, leaseUntil: new Date(Date.now() + Math.max(30_000, timeoutMs * 3)).toISOString() });
+            reserved = true;
+            return null;
+        });
+        if (deferred) return deferred;
+        if (Date.now() - started >= timeoutMs) return { state: 'unknown', source: 'conversation', reason: 'probe-timeout' };
+        result = await probe();
+        return result;
+    } catch { return { state: 'unknown', source: 'conversation', reason: 'probe-control-unavailable' }; }
+    finally {
+        if (reserved) await withStoreLockAsync(async () => {
+            // A timed-out/crashed predecessor must not release a newer lease.
+            if ((await read()).leaseId !== leaseId) return;
+            await write(result?.reason === 'probe-rate-limited'
+                ? { version: 1, retryAt: result.retryAt, endpoint: result.endpoint }
+                : { version: 1 });
+        }).catch(() => {});
+    }
+}
 
 /** Exact Chat conversations can be reconciled even after a stored wait expired. */
 export function canReconcileChatGptSession(session) {
@@ -114,10 +187,10 @@ export async function readServerResponse(page, session, { timeoutMs = 6_000 } = 
     const request = page.request || page.context?.()?.request;
     if (typeof request?.get !== 'function') return unavailable('request-client-unavailable');
     let authResponse, conversationResponse;
-    return withPollDeadline(async (_deadline, token) => {
+    return withServerProbeBackoff(() => withPollDeadline(async (_deadline, token) => {
         try {
             authResponse = await request.get(`${url.origin}/api/auth/session`, { timeout: timeoutMs, maxRedirects: 0 });
-            if (authResponse.status() === 429) return { state: 'blocked', source: 'conversation', reason: 'http-429' };
+            if (authResponse.status() === 429) return throttledProbe(authResponse, 'auth-session');
             if (!authResponse.ok()) return unavailable('authentication-unavailable');
             const auth = await authResponse.json();
             if (!auth?.accessToken || token.expired) return unavailable('authentication-unavailable');
@@ -126,7 +199,7 @@ export async function readServerResponse(page, session, { timeoutMs = 6_000 } = 
                 timeout: Math.max(1, _deadline - Date.now()), maxRedirects: 0,
                 headers: { Authorization: `Bearer ${auth.accessToken}` },
             });
-            if (conversationResponse.status() === 429) return { state: 'blocked', source: 'conversation', reason: 'http-429' };
+            if (conversationResponse.status() === 429) return throttledProbe(conversationResponse, 'conversation');
             if (!conversationResponse.ok()) return unavailable(`http-${conversationResponse.status()}`);
             const conversation = await conversationResponse.json();
             if (token.expired || page.url() !== url.href) return unavailable('conversation-changed');
@@ -136,5 +209,5 @@ export async function readServerResponse(page, session, { timeoutMs = 6_000 } = 
             await authResponse?.dispose?.().catch(() => {});
             await conversationResponse?.dispose?.().catch(() => {});
         }
-    }, { timeoutMs, onExpired: () => unavailable('probe-timeout') });
+    }, { timeoutMs, onExpired: () => unavailable('probe-timeout') }), timeoutMs);
 }
